@@ -31,10 +31,14 @@ import io
 
 SIZE_REG = (700 * MM, 400 * MM)
 SIZE_LRG = (900 * MM, 600 * MM)
+SIZE_AW = (760 * MM, 460 * MM)  # All-weather mats: 76x46cm
 
 
-def get_target_size(filename):
-    """REG/default → 700x400mm, LRG/LAR/SMA/SMALL → 900x600mm."""
+def get_target_size(filename, force_size=None):
+    """Determine target size from filename or override.
+    REG/default → 700x400mm, LRG/LAR/SMA/SMALL → 900x600mm, AW → 760x460mm."""
+    if force_size == "AW":
+        return SIZE_AW, "AW"
     name = os.path.basename(filename).upper()
     if any(tag in name for tag in ["LRG", "LAR", "SMA", "SMALL"]):
         return SIZE_LRG, "LRG"
@@ -224,14 +228,14 @@ def write_color_pdf(img, output_path, page_size):
 
 # ── Main processing ───────────────────────────────────────────────────────────
 
-def process_pdf(input_path, output_path=None, dpi=300):
+def process_pdf(input_path, output_path=None, dpi=300, force_size=None):
     """Process a single PDF: auto-detect color, vectorize or enhance."""
     if output_path is None:
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_richblack{ext}"
 
     basename = os.path.basename(input_path)
-    page_size, size_tag = get_target_size(input_path)
+    page_size, size_tag = get_target_size(input_path, force_size=force_size)
     w_mm = round(page_size[0] / MM)
     h_mm = round(page_size[1] / MM)
 
@@ -348,7 +352,7 @@ def generate_lrg_from_reg(reg_path, output_path, dpi=300):
     print(f"             -> {os.path.basename(output_path)} ({out_kb} KB)")
 
 
-def process_folder(folder_path, dpi=300, generate_missing_lrg=True):
+def process_folder(folder_path, dpi=300, generate_missing_lrg=True, force_size=None):
     """Process all PDFs: enhance existing + generate missing LRG variants."""
     output_dir = os.path.join(folder_path, "_RichBlack")
     os.makedirs(output_dir, exist_ok=True)
@@ -367,7 +371,7 @@ def process_folder(folder_path, dpi=300, generate_missing_lrg=True):
         basename = os.path.basename(pdf)
         output_path = os.path.join(output_dir, basename)
         try:
-            process_pdf(pdf, output_path=output_path, dpi=dpi)
+            process_pdf(pdf, output_path=output_path, dpi=dpi, force_size=force_size)
             done += 1
         except Exception as e:
             print(f"  ERROR on {basename}: {e}")
@@ -432,12 +436,15 @@ if __name__ == "__main__":
     # Optional flags
     skip_lrg = "--no-lrg" in sys.argv
     lrg_only = "--lrg-only" in sys.argv
+    aw_mode = "--aw" in sys.argv  # All-weather: force 760x460mm, no LRG gen
+    force_size = "AW" if aw_mode else None
 
     if os.path.isdir(target):
-        if lrg_only:
-            # Only generate missing LRG variants (skip Pass 1)
+        if aw_mode:
+            process_folder(target, dpi=dpi, generate_missing_lrg=False, force_size="AW")
+        elif lrg_only:
             process_folder(target, dpi=dpi, generate_missing_lrg=True)
         else:
             process_folder(target, dpi=dpi, generate_missing_lrg=not skip_lrg)
     else:
-        process_pdf(target, dpi=dpi)
+        process_pdf(target, dpi=dpi, force_size=force_size)
