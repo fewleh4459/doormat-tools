@@ -1,0 +1,26 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "TradeWind Dev Server",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "server/index.ts"],
+      "port": 5001,
+      "cwd": "C:/Claude/projects/TradeWind-Label-Mover-v2",
+      "env": {
+        "NODE_ENV": "development",
+        "PORT": "5001"
+      }
+    },
+    {
+      "name": "Tradewind Frontend",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["--env-file=.env", "--import=tsx", "server/index.ts"],
+      "port": 5002,
+      "cwd": "C:/Claude/Tradewind-Shipping-Front-end",
+      "env": {
+        "NODE_ENV": "development"
+      }
+    }
+  ]
+}
