@@ -17,7 +17,7 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["--env-file=.env", "--import=tsx", "server/index.ts"],
       "port": 5002,
-      "cwd": "C:/Claude/Tradewind-Shipping-Front-end",
+      "cwd": "C:/Claude/projects/Tradewind-Shipping-Front-end",
       "env": {
         "NODE_ENV": "development"
       }
