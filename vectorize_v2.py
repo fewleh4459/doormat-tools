@@ -147,16 +147,15 @@ def write_bw_vector_pdf(traced_path, output_path, page_size, bitmap_size):
 
     ops = ["1 1 1 1 k"]  # Rich black CMYK
 
-    # Skip page boundary (largest CCW rect with <=4 segments)
-    skip_idx = None
-    min_area = 0
+    # Skip ALL large CCW rectangles (<=4 segments, large negative area)
+    # These are page boundaries that cause inversion when filled
+    skip_indices = set()
     for i, (cv, area) in enumerate(zip(curves, areas)):
-        if area < min_area and len(cv.segments) <= 4:
-            min_area = area
-            skip_idx = i
+        if area < -1000000 and len(cv.segments) <= 4:
+            skip_indices.add(i)
 
     for i, curve in enumerate(curves):
-        if i == skip_idx:
+        if i in skip_indices:
             continue
         ops.extend(emit_curve_ops(curve, sx, sy, page_h))
 
@@ -208,16 +207,22 @@ def boost_color_image_cmyk(img, ink_boost=1.5, black_threshold=60):
     return Image.fromarray(arr.astype(np.uint8), mode="CMYK")
 
 
-def write_color_pdf(img, output_path, page_size):
-    """Write a CMYK image as a high-res PDF with embedded CMYK data."""
+def write_color_pdf(img, output_path, page_size, dpi=150):
+    """Write a CMYK image as a compressed PDF at target DPI."""
     page_w, page_h = page_size
 
-    # Save CMYK image as TIFF (supports CMYK natively)
+    # Resize to target DPI to keep file size manageable
+    target_w = int(page_w / 72 * dpi)
+    target_h = int(page_h / 72 * dpi)
+    if img.size[0] > target_w or img.size[1] > target_h:
+        img = img.resize((target_w, target_h), Image.LANCZOS)
+
+    # Save with compression
     img_buffer = io.BytesIO()
     if img.mode == "CMYK":
-        img.save(img_buffer, format='TIFF')
+        img.save(img_buffer, format='TIFF', compression='tiff_deflate')
     else:
-        img.save(img_buffer, format='PNG')
+        img.save(img_buffer, format='PNG', optimize=True)
     img_buffer.seek(0)
 
     c = canvas.Canvas(output_path, pagesize=(page_w, page_h))
@@ -268,41 +273,21 @@ def generate_lrg_from_reg(reg_path, output_path, dpi=300):
 
     if has_color:
         img = boost_color_image_cmyk(img)
-        # Scale to fit within LRG artboard, maintaining aspect ratio
-        img_w, img_h = img.size
-        scale = min((page_w / MM) / (700), (page_h / MM) / (400))
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        img_scaled = img.resize((new_w, new_h), Image.LANCZOS)
+        # Stretch to fill LRG artboard (different aspect ratio is acceptable)
+        target_w = int(page_w / 72 * 150)  # 150 DPI for color
+        target_h = int(page_h / 72 * 150)
+        img_stretched = img.resize((target_w, target_h), Image.LANCZOS)
 
-        # Create white canvas at LRG resolution in CMYK
-        lrg_w = int(900 * dpi / 25.4)
-        lrg_h = int(600 * dpi / 25.4)
-        # CMYK white = (0, 0, 0, 0)
-        canvas_img = Image.new("CMYK", (lrg_w, lrg_h), (0, 0, 0, 0))
-        # Center
-        x_off = (lrg_w - new_w) // 2
-        y_off = (lrg_h - new_h) // 2
-        canvas_img.paste(img_scaled, (x_off, y_off))
-
-        print(f"[COLOR-LRG] {basename} -> {w_mm}x{h_mm}mm (centered)")
-        write_color_pdf(canvas_img, output_path, SIZE_LRG)
+        print(f"[COLOR-LRG] {basename} -> {w_mm}x{h_mm}mm (stretched to fill)")
+        write_color_pdf(img_stretched, output_path, SIZE_LRG, dpi=150)
     else:
-        # B&W: trace, then scale and center vectors on LRG artboard
+        # B&W: trace, then stretch vectors to fill LRG artboard
         traced = trace_bitmap(img)
         bmp_w, bmp_h = img.size
 
-        # Calculate scaling to center REG content on LRG page
-        reg_w, reg_h = SIZE_REG
-        # Scale factor to fit REG into LRG maintaining aspect ratio
-        scale = min(page_w / reg_w, page_h / reg_h)
-        scaled_w = reg_w * scale
-        scaled_h = reg_h * scale
-        x_offset = (page_w - scaled_w) / 2
-        y_offset = (page_h - scaled_h) / 2
-
-        sx = scaled_w / bmp_w
-        sy = scaled_h / bmp_h
+        # Independent scale factors for X and Y (stretch to fill)
+        sx = page_w / bmp_w
+        sy = page_h / bmp_h
 
         c = canvas.Canvas(output_path, pagesize=(page_w, page_h))
         curves = list(traced)
@@ -310,29 +295,27 @@ def generate_lrg_from_reg(reg_path, output_path, dpi=300):
 
         ops = ["1 1 1 1 k"]
 
-        skip_idx = None
-        min_area = 0
+        # Skip ALL large CCW rectangles (page boundaries)
+        skip_indices = set()
         for i, (cv, area) in enumerate(zip(curves, areas)):
-            if area < min_area and len(cv.segments) <= 4:
-                min_area = area
-                skip_idx = i
+            if area < -1000000 and len(cv.segments) <= 4:
+                skip_indices.add(i)
 
-        # Emit curves with offset for centering
         for i, curve in enumerate(curves):
-            if i == skip_idx:
+            if i in skip_indices:
                 continue
             sub_ops = []
             start = curve.start_point
-            sub_ops.append(f"{start.x * sx + x_offset:.4f} {page_h - (start.y * sy + y_offset):.4f} m")
+            sub_ops.append(f"{start.x * sx:.4f} {page_h - start.y * sy:.4f} m")
             for seg in curve.segments:
                 if seg.is_corner:
-                    sub_ops.append(f"{seg.c.x * sx + x_offset:.4f} {page_h - (seg.c.y * sy + y_offset):.4f} l")
-                    sub_ops.append(f"{seg.end_point.x * sx + x_offset:.4f} {page_h - (seg.end_point.y * sy + y_offset):.4f} l")
+                    sub_ops.append(f"{seg.c.x * sx:.4f} {page_h - seg.c.y * sy:.4f} l")
+                    sub_ops.append(f"{seg.end_point.x * sx:.4f} {page_h - seg.end_point.y * sy:.4f} l")
                 else:
                     sub_ops.append(
-                        f"{seg.c1.x * sx + x_offset:.4f} {page_h - (seg.c1.y * sy + y_offset):.4f} "
-                        f"{seg.c2.x * sx + x_offset:.4f} {page_h - (seg.c2.y * sy + y_offset):.4f} "
-                        f"{seg.end_point.x * sx + x_offset:.4f} {page_h - (seg.end_point.y * sy + y_offset):.4f} c"
+                        f"{seg.c1.x * sx:.4f} {page_h - seg.c1.y * sy:.4f} "
+                        f"{seg.c2.x * sx:.4f} {page_h - seg.c2.y * sy:.4f} "
+                        f"{seg.end_point.x * sx:.4f} {page_h - seg.end_point.y * sy:.4f} c"
                     )
             sub_ops.append("h")
             ops.extend(sub_ops)
@@ -346,7 +329,7 @@ def generate_lrg_from_reg(reg_path, output_path, dpi=300):
         c.showPage()
         c.save()
 
-        print(f"[B&W-LRG]   {basename} -> {w_mm}x{h_mm}mm (centered)")
+        print(f"[B&W-LRG]   {basename} -> {w_mm}x{h_mm}mm (stretched to fill)")
 
     out_kb = os.path.getsize(output_path) // 1024
     print(f"             -> {os.path.basename(output_path)} ({out_kb} KB)")
