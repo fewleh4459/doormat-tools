@@ -149,10 +149,16 @@ def process_and_replace(filepath, force_size=None):
 def watch_loop():
     """Main watching loop — scans all folders for new files."""
     setup_logging()
+
+    # Record start time — only process files modified AFTER this point
+    # This prevents re-processing thousands of existing files on first run
+    start_time = time.time()
+
     logging.info("=" * 60)
     logging.info("Doormat Design Watcher started")
     logging.info(f"Watching {len(WATCHED_FOLDERS)} folders")
     logging.info(f"Scan interval: {SCAN_INTERVAL}s")
+    logging.info(f"Only processing files modified after: {datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}")
     logging.info("=" * 60)
 
     while True:
@@ -165,6 +171,14 @@ def watch_loop():
 
                 for pdf in sorted(unprocessed):
                     basename = os.path.basename(pdf)
+
+                    # Skip files that existed before the watcher started
+                    try:
+                        file_mtime = os.path.getmtime(pdf)
+                        if file_mtime < start_time:
+                            continue
+                    except OSError:
+                        continue
 
                     # Check file is stable (not still syncing)
                     if not is_file_stable(pdf):
