@@ -1,0 +1,7 @@
+PyMuPDF
+pillow
+potracer
+reportlab
+svglib
+opencv-python-headless
+numpy

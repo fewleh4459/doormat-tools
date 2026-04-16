@@ -93,10 +93,18 @@ def pdf_to_bitmap(pdf_path, dpi=300):
 # ── B&W vectorization pipeline ────────────────────────────────────────────────
 
 def trace_bitmap(img, threshold=200):
-    """Trace B&W image to vector paths."""
+    """Trace B&W image to vector paths.
+    Clears 2px border to prevent potrace edge-following contours
+    that cause inversion when foreground pixels touch bitmap edges."""
     gray = img.convert("L")
     arr = np.array(gray)
     bw = arr < threshold
+    # Clear edge pixels — prevents potrace from creating large contours
+    # that follow the bitmap border when even a few dark pixels touch edges
+    bw[:2, :] = False
+    bw[-2:, :] = False
+    bw[:, :2] = False
+    bw[:, -2:] = False
     bitmap = potrace.Bitmap(bw)
     path = bitmap.trace(
         turdsize=2, alphamax=1.0, opticurve=True, opttolerance=0.2,
@@ -231,10 +239,30 @@ def write_color_pdf(img, output_path, page_size, dpi=150):
     c.save()
 
 
+# ── Output validation ────────────────────────────────────────────────────────
+
+def _black_ratio(pdf_path):
+    """Render PDF at low res and return fraction of dark pixels."""
+    doc = fitz.open(pdf_path)
+    pix = doc[0].get_pixmap(matrix=fitz.Matrix(0.5, 0.5), colorspace=fitz.csGRAY)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    doc.close()
+    return float(np.sum(arr < 128)) / arr.size
+
+
+def _is_output_inverted(input_path, output_path, threshold=0.30):
+    """Check if the output PDF has dramatically more black than the input."""
+    orig = _black_ratio(input_path)
+    out = _black_ratio(output_path)
+    return (out - orig) > threshold
+
+
 # ── Main processing ───────────────────────────────────────────────────────────
 
 def process_pdf(input_path, output_path=None, dpi=300, force_size=None):
-    """Process a single PDF: auto-detect color, vectorize or enhance."""
+    """Process a single PDF: auto-detect color, vectorize or enhance.
+    For B&W files, validates the output and falls back to raster CMYK
+    if the vectorization produces an inverted result."""
     if output_path is None:
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_richblack{ext}"
@@ -257,6 +285,12 @@ def process_pdf(input_path, output_path=None, dpi=300, force_size=None):
         img, _ = pdf_to_bitmap(input_path, dpi=dpi)
         traced = trace_bitmap(img)
         write_bw_vector_pdf(traced, output_path, page_size, img.size)
+
+        # Validate: check for inversion
+        if _is_output_inverted(input_path, output_path):
+            print(f"        !! Inversion detected — falling back to raster CMYK")
+            img_cmyk = boost_color_image_cmyk(img, ink_boost=1.0)
+            write_color_pdf(img_cmyk, output_path, page_size, dpi=150)
 
     out_kb = os.path.getsize(output_path) // 1024
     print(f"        -> {os.path.basename(output_path)} ({out_kb} KB)")
@@ -283,51 +317,18 @@ def generate_lrg_from_reg(reg_path, output_path, dpi=300):
     else:
         # B&W: trace, then stretch vectors to fill LRG artboard
         traced = trace_bitmap(img)
-        bmp_w, bmp_h = img.size
+        write_bw_vector_pdf(traced, output_path, SIZE_LRG, img.size)
 
-        # Independent scale factors for X and Y (stretch to fill)
-        sx = page_w / bmp_w
-        sy = page_h / bmp_h
-
-        c = canvas.Canvas(output_path, pagesize=(page_w, page_h))
-        curves = list(traced)
-        areas = [curve_signed_area(cv) for cv in curves]
-
-        ops = ["1 1 1 1 k"]
-
-        # Skip ALL large CCW rectangles (page boundaries)
-        skip_indices = set()
-        for i, (cv, area) in enumerate(zip(curves, areas)):
-            if area < -1000000 and len(cv.segments) <= 4:
-                skip_indices.add(i)
-
-        for i, curve in enumerate(curves):
-            if i in skip_indices:
-                continue
-            sub_ops = []
-            start = curve.start_point
-            sub_ops.append(f"{start.x * sx:.4f} {page_h - start.y * sy:.4f} m")
-            for seg in curve.segments:
-                if seg.is_corner:
-                    sub_ops.append(f"{seg.c.x * sx:.4f} {page_h - seg.c.y * sy:.4f} l")
-                    sub_ops.append(f"{seg.end_point.x * sx:.4f} {page_h - seg.end_point.y * sy:.4f} l")
-                else:
-                    sub_ops.append(
-                        f"{seg.c1.x * sx:.4f} {page_h - seg.c1.y * sy:.4f} "
-                        f"{seg.c2.x * sx:.4f} {page_h - seg.c2.y * sy:.4f} "
-                        f"{seg.end_point.x * sx:.4f} {page_h - seg.end_point.y * sy:.4f} c"
-                    )
-            sub_ops.append("h")
-            ops.extend(sub_ops)
-
-        ops.append("f")
-
-        c.saveState()
-        for op in ops:
-            c._code.append(op)
-        c.restoreState()
-        c.showPage()
-        c.save()
+        # Validate: check for inversion (compare to REG original)
+        orig_ratio = _black_ratio(reg_path)
+        out_ratio = _black_ratio(output_path)
+        if (out_ratio - orig_ratio) > 0.30:
+            print(f"        !! LRG inversion detected — falling back to raster CMYK")
+            img_cmyk = boost_color_image_cmyk(img, ink_boost=1.0)
+            target_w = int(page_w / 72 * 150)
+            target_h = int(page_h / 72 * 150)
+            img_stretched = img_cmyk.resize((target_w, target_h), Image.LANCZOS)
+            write_color_pdf(img_stretched, output_path, SIZE_LRG, dpi=150)
 
         print(f"[B&W-LRG]   {basename} -> {w_mm}x{h_mm}mm (stretched to fill)")
 
