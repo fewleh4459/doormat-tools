@@ -41,6 +41,12 @@ The routine watches the **Print parent folders** recursively (all subfolders inc
 - `Etsy`, `Shopify`, `Amazon`, `eBay` — marketplace orders (no LRG generation)
 - Monthly folders (e.g., `Jan 2026`) — personalised orders, created as needed
 
+### Pending: Dropbox folder
+
+There is one additional folder on Dropbox that needs monitoring. Add when
+Anthropic ships a Dropbox MCP connector (not available as of 2026-04-16).
+Alternative: integrate via Dropbox REST API + access token env var.
+
 ## Processing rules
 
 - **B&W designs**: Vectorize with potrace, fill rich black (C100/M100/Y100/K100). Clear 2px bitmap border before tracing to prevent edge-following contour bugs. After writing, validate output vs original — if inverted (>30% more black), fall back to raster CMYK.
