@@ -54,15 +54,24 @@ Alternative: integrate via Dropbox REST API + access token env var.
 - **Sizes**: REG=700x400mm, LRG=900x600mm, AW=760x460mm. Exact mm values enforced.
 - **LRG generation**: For coir folders, auto-generate LRG variants for any SKU that only has a REG file.
 
-## Routine (cloud watcher)
+## Routines (cloud watchers)
 
-This repo is designed to run as a Claude Code Routine that monitors Google Drive folders for new unprocessed PDFs. The routine:
+Two separate Routines monitor Google Drive efficiently:
 
-1. Scans watched folders via Google Drive MCP connector
-2. Identifies unprocessed files (no `_p.pdf` suffix and no processed version exists)
-3. Downloads, processes with `vectorize_v2.py`, uploads result with `_p` suffix
-4. Deletes the original after successful processing
-5. Generates LRG variants for coir mat folders when only REG exists
+### Routine 1: Etsy Fast Watcher (hourly)
+Monitors ONLY the current-month subfolders inside each brand's Etsy folder. Uses Drive's `modifiedTime > [now - 90 min]` filter so each run only sees recently-saved files — minimal token usage.
+
+### Routine 2: Daily Sweep (once per day, e.g. 2am)
+Catches everything else: Statics (with LRG generation), Bulks, Reprints, Express, Amazon, Shopify, eBay. Uses `modifiedTime > [now - 26 hours]` so it only looks at the last day's changes.
+
+### Query efficiency
+Both routines use Drive's native `search_files` with `modifiedTime > X AND mimeType = 'application/pdf' AND not name contains '_p.pdf'` — never recursively lists entire folder trees. This keeps token usage low regardless of how many files exist historically.
+
+### Skip rules (both routines)
+- Any folder with `OLD` in the name
+- Any folder named `_RichBlack` (already processed output)
+- Any folder containing `TEST` or `print-tests`
+- Subfolders for past months/years inside Etsy (only current month matters)
 
 ## Dependencies
 
