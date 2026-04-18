@@ -292,10 +292,21 @@ def process_pdf(input_path, output_path=None, dpi=300, force_size=None):
     has_color, color_pct = is_color_pdf(input_path)
 
     if has_color:
-        print(f"[COLOR] {basename} -> {w_mm}x{h_mm}mm ({size_tag}, {color_pct:.1f}% color)")
-        img, _ = pdf_to_bitmap(input_path, dpi=dpi)
+        # Colour files render as raster CMYK — memory-bound. On small cloud VMs
+        # (e.g. Replit Reserved VM at 0.5 vCPU / 2 GiB RAM), rendering at 300 DPI
+        # produces a 130+ MB numpy buffer which, combined with mousekeeping +
+        # fonts in RAM, can OOM or swap-thrash. Drop to 200 DPI for colour
+        # (still >1000 DPI effective for a 60x40cm doormat at arm's length)
+        # unless explicitly overridden via dpi kwarg.
+        colour_dpi = int(os.environ.get("COLOUR_DPI", "200"))
+        print(f"[COLOR] {basename} -> {w_mm}x{h_mm}mm ({size_tag}, {color_pct:.1f}% color, {colour_dpi} DPI)")
+        img, _ = pdf_to_bitmap(input_path, dpi=colour_dpi)
         img = boost_color_image_cmyk(img)
         write_color_pdf(img, output_path, page_size)
+        # Explicitly release the large image buffer before we leave the function
+        del img
+        import gc
+        gc.collect()
     else:
         print(f"[B&W]   {basename} -> {w_mm}x{h_mm}mm ({size_tag})")
         img, _ = pdf_to_bitmap(input_path, dpi=dpi)
