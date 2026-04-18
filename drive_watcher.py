@@ -85,11 +85,11 @@ SKIP_TITLE_FRAGMENTS = [
 
 # Folder titles that are always skipped on exact (case-insensitive) match.
 # Used for folders whose name is a common word — fragment match would be too broad.
-EXACT_SKIP_TITLES = {"processed"}
+EXACT_SKIP_TITLES = {"processed", "originals"}
 
 # Name of the subfolder where originals are archived after processing.
 # Using an exact match so legitimate folders like "Pre-processed" aren't skipped.
-PROCESSED_SUBFOLDER_NAME = "Processed"
+PROCESSED_SUBFOLDER_NAME = "Originals"
 
 SIZE_TITLES = {
     "small", "medium", "large", "regular", "reg", "lrg", "sml", "med",
@@ -626,7 +626,7 @@ def get_or_create_processed_subfolder(parent_id: str) -> str | None:
         log.info(f"Created '{PROCESSED_SUBFOLDER_NAME}' subfolder (id={folder_id})")
         return folder_id
     except HttpError as e:
-        log.error(f"Could not create Processed subfolder: {e}")
+        log.error(f"Could not create Originals subfolder: {e}")
         return None
 
 
@@ -648,7 +648,7 @@ def move_file_to_processed(file_id: str, current_parent_id: str) -> bool:
         ).execute()
         return True
     except HttpError as e:
-        log.error(f"Move to Processed failed for {file_id}: {e}")
+        log.error(f"Move to Originals failed for {file_id}: {e}")
         return False
 
 
@@ -712,7 +712,7 @@ def process_one(file_meta: dict, root_title: str, force_size: str | None = None)
     archive_msg = ""
     if archive_enabled:
         if move_file_to_processed(file_id, parent_id):
-            archive_msg = " (original → Processed/)"
+            archive_msg = " (original → Originals/)"
         else:
             archive_msg = " (original kept, archive move failed)"
     else:
