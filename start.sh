@@ -44,23 +44,31 @@ if [ ! -d "$MOUSEKEEPING_DIR" ]; then
 fi
 
 # ── Background: wait for mousekeeping's port, then start drive_watcher ──────
+# Output goes to BOTH stdout (visible in Replit Deployment Logs panel) AND
+# the log file (for historical grep on the VM). Using `tee -a` for both
+# so developers can diagnose without shelling into the deploy machine.
 (
   echo "[watcher-gate] waiting for port $HEALTHCHECK_PORT (max ${WATCHER_STARTUP_DELAY_MAX}s)"
+  port_opened=false
   for ((i=0; i<WATCHER_STARTUP_DELAY_MAX; i++)); do
     if (exec 3<>/dev/tcp/127.0.0.1/$HEALTHCHECK_PORT) 2>/dev/null; then
       exec 3>&- 2>/dev/null
       echo "[watcher-gate] port $HEALTHCHECK_PORT is open — starting drive_watcher"
+      port_opened=true
       break
     fi
     sleep 1
   done
+  if [ "$port_opened" != true ]; then
+    echo "[watcher-gate] WARNING: port $HEALTHCHECK_PORT never opened within ${WATCHER_STARTUP_DELAY_MAX}s — starting drive_watcher anyway"
+  fi
 
   cd "$DOORMAT_DIR"
   while true; do
-    echo "[watcher-loop] $(date -Iseconds) — starting drive_watcher.py" >> "$WATCHER_LOG"
-    python drive_watcher.py >> "$WATCHER_LOG" 2>&1
-    exit_code=$?
-    echo "[watcher-loop] $(date -Iseconds) — drive_watcher exited (code=$exit_code); restarting in 10s" >> "$WATCHER_LOG"
+    echo "[watcher-loop] $(date -Iseconds) — starting drive_watcher.py" | tee -a "$WATCHER_LOG"
+    python -u drive_watcher.py 2>&1 | tee -a "$WATCHER_LOG"
+    exit_code=${PIPESTATUS[0]}
+    echo "[watcher-loop] $(date -Iseconds) — drive_watcher exited (code=$exit_code); restarting in 10s" | tee -a "$WATCHER_LOG"
     sleep 10
   done
 ) &
