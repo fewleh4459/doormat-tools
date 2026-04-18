@@ -692,7 +692,7 @@ def process_one(file_meta: dict, root_title: str, force_size: str | None = None)
 
         output_path = os.path.join(tmpdir, f"{stem}_p.pdf")
         try:
-            process_pdf(input_path, output_path=output_path, dpi=300, force_size=effective_force_size)
+            process_pdf(input_path, output_path=output_path, dpi=150, force_size=effective_force_size)
         except Exception as e:
             log.error(f"  {name}: processing error: {e}")
             return False, f"{name}: process error: {e}"

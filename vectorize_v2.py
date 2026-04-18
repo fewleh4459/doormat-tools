@@ -275,7 +275,7 @@ def _is_output_inverted(input_path, output_path, threshold=0.30):
 
 # ── Main processing ───────────────────────────────────────────────────────────
 
-def process_pdf(input_path, output_path=None, dpi=300, force_size=None):
+def process_pdf(input_path, output_path=None, dpi=150, force_size=None):
     """Process a single PDF: auto-detect color, vectorize or enhance.
     For B&W files, validates the output and falls back to raster CMYK
     if the vectorization produces an inverted result."""
@@ -292,23 +292,16 @@ def process_pdf(input_path, output_path=None, dpi=300, force_size=None):
     has_color, color_pct = is_color_pdf(input_path)
 
     if has_color:
-        # Colour files render as raster CMYK — memory-bound. On small cloud VMs
-        # (e.g. Replit Reserved VM at 0.5 vCPU / 2 GiB RAM), rendering at 300 DPI
-        # produces a 130+ MB numpy buffer which, combined with mousekeeping +
-        # fonts in RAM, can OOM or swap-thrash. Drop to 200 DPI for colour
-        # (still >1000 DPI effective for a 60x40cm doormat at arm's length)
-        # unless explicitly overridden via dpi kwarg.
-        colour_dpi = int(os.environ.get("COLOUR_DPI", "200"))
-        print(f"[COLOR] {basename} -> {w_mm}x{h_mm}mm ({size_tag}, {color_pct:.1f}% color, {colour_dpi} DPI)")
-        img, _ = pdf_to_bitmap(input_path, dpi=colour_dpi)
+        print(f"[COLOR] {basename} -> {w_mm}x{h_mm}mm ({size_tag}, {color_pct:.1f}% color, {dpi} DPI)")
+        img, _ = pdf_to_bitmap(input_path, dpi=dpi)
         img = boost_color_image_cmyk(img)
-        write_color_pdf(img, output_path, page_size)
-        # Explicitly release the large image buffer before we leave the function
+        write_color_pdf(img, output_path, page_size, dpi=dpi)
+        # Explicitly free the large image buffer before leaving
         del img
         import gc
         gc.collect()
     else:
-        print(f"[B&W]   {basename} -> {w_mm}x{h_mm}mm ({size_tag})")
+        print(f"[B&W]   {basename} -> {w_mm}x{h_mm}mm ({size_tag}, {dpi} DPI)")
         img, _ = pdf_to_bitmap(input_path, dpi=dpi)
         traced = trace_bitmap(img)
         write_bw_vector_pdf(traced, output_path, page_size, img.size)
@@ -317,7 +310,7 @@ def process_pdf(input_path, output_path=None, dpi=300, force_size=None):
         if _is_output_inverted(input_path, output_path):
             print(f"        !! Inversion detected — falling back to raster CMYK")
             img_cmyk = boost_color_image_cmyk(img, ink_boost=1.0)
-            write_color_pdf(img_cmyk, output_path, page_size, dpi=150)
+            write_color_pdf(img_cmyk, output_path, page_size, dpi=dpi)
 
     out_kb = os.path.getsize(output_path) // 1024
     print(f"        -> {os.path.basename(output_path)} ({out_kb} KB)")
