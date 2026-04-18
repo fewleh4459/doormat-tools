@@ -50,14 +50,19 @@ fi
 (
   echo "[watcher-gate] waiting for port $HEALTHCHECK_PORT (max ${WATCHER_STARTUP_DELAY_MAX}s)"
   port_opened=false
+  # Use curl (always present in Nix Node images) rather than bash /dev/tcp,
+  # which isn't always compiled in on Replit's deployment containers.
   for ((i=0; i<WATCHER_STARTUP_DELAY_MAX; i++)); do
-    if (exec 3<>/dev/tcp/127.0.0.1/$HEALTHCHECK_PORT) 2>/dev/null; then
-      exec 3>&- 2>/dev/null
-      echo "[watcher-gate] port $HEALTHCHECK_PORT is open — starting drive_watcher"
+    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$HEALTHCHECK_PORT/" 2>/dev/null; then
+      echo "[watcher-gate] port $HEALTHCHECK_PORT is open (${i}s) — starting drive_watcher"
       port_opened=true
       break
     fi
     sleep 1
+    # Progress heartbeat every 15 s so it's obvious we're still waiting
+    if (( i > 0 && i % 15 == 0 )); then
+      echo "[watcher-gate] still waiting for port $HEALTHCHECK_PORT (${i}s elapsed)"
+    fi
   done
   if [ "$port_opened" != true ]; then
     echo "[watcher-gate] WARNING: port $HEALTHCHECK_PORT never opened within ${WATCHER_STARTUP_DELAY_MAX}s — starting drive_watcher anyway"
