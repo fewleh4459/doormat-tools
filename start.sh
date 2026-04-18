@@ -1,39 +1,59 @@
 #!/bin/bash
-# Orchestrator: runs drive_watcher.py in background and hands off to mousekeeping.
+# Orchestrator for the Replit Reserved VM — runs drive_watcher.py in a restart
+# loop in the background, and hands off to mousekeeping (npm run dev) in the
+# foreground.
 #
-# Use this as your Replit run command when you want the doormat watcher running
-# alongside mousekeeping on the same Reserved VM:
+# Use this as your Replit run command:
+#     run = "bash doormat-tools/start.sh"
 #
-#   run = "bash /home/runner/workspace/doormat-tools/start.sh"
-#
-# Expectations on the VM layout (monorepo style):
-#   /home/runner/workspace/doormat-tools/   (this repo)
-#   /home/runner/workspace/mousekeeping/    (mousekeeping repo cloned alongside)
-#
-# If your layout is different, edit the MOUSEKEEPING_DIR path below.
+# If mousekeeping exits, this script exits (and Replit restarts the whole thing).
+# If drive_watcher.py exits (crash or python error), it's auto-restarted after 10s.
 
-set -e
+set -u
 
-DOORMAT_DIR="$(cd "$(dirname "$0")" && pwd)"
-MOUSEKEEPING_DIR="${MOUSEKEEPING_DIR:-$DOORMAT_DIR/../mousekeeping}"
+# Paths — tweak if your layout differs
+DOORMAT_DIR="${DOORMAT_DIR:-/home/runner/workspace/doormat-tools}"
+MOUSEKEEPING_DIR="${MOUSEKEEPING_DIR:-/home/runner/workspace}"
+MOUSEKEEPING_CMD="${MOUSEKEEPING_CMD:-npm run dev}"
 
-echo "[start.sh] doormat dir:     $DOORMAT_DIR"
-echo "[start.sh] mousekeeping dir: $MOUSEKEEPING_DIR"
+LOG_DIR="${LOG_DIR:-$DOORMAT_DIR/logs}"
+mkdir -p "$LOG_DIR"
+WATCHER_LOG="$LOG_DIR/drive_watcher.log"
 
-# Start the doormat Drive watcher in background
-cd "$DOORMAT_DIR"
-nohup python drive_watcher.py > "$DOORMAT_DIR/drive_watcher.log" 2>&1 &
-DOORMAT_PID=$!
-echo "[start.sh] drive_watcher started (PID $DOORMAT_PID)"
+echo "[start.sh] $(date -Iseconds) — starting services"
+echo "[start.sh]   DOORMAT_DIR       = $DOORMAT_DIR"
+echo "[start.sh]   MOUSEKEEPING_DIR  = $MOUSEKEEPING_DIR"
+echo "[start.sh]   MOUSEKEEPING_CMD  = $MOUSEKEEPING_CMD"
+echo "[start.sh]   WATCHER_LOG       = $WATCHER_LOG"
 
-# Forward termination signals so the background process dies with us
-trap "echo '[start.sh] shutting down'; kill $DOORMAT_PID 2>/dev/null; exit" SIGINT SIGTERM
-
-# Hand off to mousekeeping in the foreground
-if [ -d "$MOUSEKEEPING_DIR" ]; then
-  cd "$MOUSEKEEPING_DIR"
-  exec npm start
-else
-  echo "[start.sh] mousekeeping dir not found — running doormat watcher alone"
-  wait $DOORMAT_PID
+# Fail fast if the directories don't exist
+if [ ! -d "$DOORMAT_DIR" ]; then
+  echo "[start.sh] FATAL: $DOORMAT_DIR does not exist"
+  exit 1
 fi
+if [ ! -d "$MOUSEKEEPING_DIR" ]; then
+  echo "[start.sh] FATAL: $MOUSEKEEPING_DIR does not exist"
+  exit 1
+fi
+
+# ── Background: drive_watcher.py with restart loop ───────────────────────────
+(
+  cd "$DOORMAT_DIR"
+  while true; do
+    echo "[watcher-loop] $(date -Iseconds) — starting drive_watcher.py" >> "$WATCHER_LOG"
+    python drive_watcher.py >> "$WATCHER_LOG" 2>&1
+    exit_code=$?
+    echo "[watcher-loop] $(date -Iseconds) — drive_watcher exited (code=$exit_code); restarting in 10s" >> "$WATCHER_LOG"
+    sleep 10
+  done
+) &
+WATCHER_LOOP_PID=$!
+echo "[start.sh] drive_watcher loop started (pid=$WATCHER_LOOP_PID) → tail -f $WATCHER_LOG"
+
+# Forward SIGINT/SIGTERM to the watcher loop so a clean Replit stop kills both
+trap "echo '[start.sh] shutting down…'; kill $WATCHER_LOOP_PID 2>/dev/null; exit" SIGINT SIGTERM
+
+# ── Foreground: mousekeeping ────────────────────────────────────────────────
+cd "$MOUSEKEEPING_DIR"
+echo "[start.sh] handing off to: $MOUSEKEEPING_CMD"
+exec $MOUSEKEEPING_CMD
