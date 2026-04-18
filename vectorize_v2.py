@@ -29,21 +29,37 @@ import io
 
 # ── Size helpers ──────────────────────────────────────────────────────────────
 
-SIZE_REG = (700 * MM, 400 * MM)
-SIZE_LRG = (900 * MM, 600 * MM)
-SIZE_AW = (760 * MM, 460 * MM)  # All-weather mats: 76x46cm
+SIZE_REG = (700 * MM, 400 * MM)       # Medium / Regular (70x40cm)
+SIZE_LRG = (900 * MM, 600 * MM)       # Large (90x60cm)
+SIZE_AW = (760 * MM, 460 * MM)        # All-weather (76x46cm)
+SIZE_SMALL = (600 * MM, 400 * MM)     # Small (60x40cm)
+
+# Mapping from force_size strings to (dimensions, label)
+_SIZE_TABLE = {
+    "SMALL": (SIZE_SMALL, "SMALL"),
+    "MED":   (SIZE_REG,   "REG"),     # MED == REG dimensions
+    "REG":   (SIZE_REG,   "REG"),
+    "LRG":   (SIZE_LRG,   "LRG"),
+    "LAR":   (SIZE_LRG,   "LRG"),     # LAR == LRG
+    "AW":    (SIZE_AW,    "AW"),
+}
 
 
 def get_target_size(filename, force_size=None):
     """Determine target size from filename or override.
-    REG/default → 700x400mm, LRG/LAR/SMA/SMALL → 900x600mm, AW → 760x460mm."""
-    if force_size == "AW":
-        return SIZE_AW, "AW"
+
+    force_size overrides everything. Accepts: SMALL, MED/REG, LRG/LAR, AW.
+    If force_size is None, falls back to filename-based matching (legacy):
+    LRG/LAR/SMA/SMALL in name → 900x600mm (legacy behaviour).
+    """
+    if force_size and force_size in _SIZE_TABLE:
+        return _SIZE_TABLE[force_size]
+
+    # Legacy filename-based matching (unchanged from original behaviour)
     name = os.path.basename(filename).upper()
     if any(tag in name for tag in ["LRG", "LAR", "SMA", "SMALL"]):
         return SIZE_LRG, "LRG"
-    else:
-        return SIZE_REG, "REG"
+    return SIZE_REG, "REG"
 
 
 def get_sku(filename):

@@ -83,10 +83,62 @@ SKIP_TITLE_FRAGMENTS = [
     "backup", "archive", "do not use", "dnu", "deprecated",
 ]
 
+# Folder titles that are always skipped on exact (case-insensitive) match.
+# Used for folders whose name is a common word — fragment match would be too broad.
+EXACT_SKIP_TITLES = {"processed"}
+
+# Name of the subfolder where originals are archived after processing.
+# Using an exact match so legitimate folders like "Pre-processed" aren't skipped.
+PROCESSED_SUBFOLDER_NAME = "Processed"
+
 SIZE_TITLES = {
     "small", "medium", "large", "regular", "reg", "lrg", "sml", "med",
     "sma", "lar", "xl", "xxl", "mini", "tiny", "big",
 }
+
+# Folder-name → force_size string passed to vectorize_v2.process_pdf.
+# Covers both named folders ("Small") and dimension folders ("60x40", "700x400mm").
+SIZE_FOLDER_MAP = {
+    # Named sizes
+    "small": "SMALL", "sml": "SMALL", "sma": "SMALL",
+    "medium": "MED", "med": "MED", "regular": "MED", "reg": "MED",
+    "large": "LAR", "lrg": "LAR", "lar": "LAR",
+    "exact": "AW", "aw": "AW",
+    "all weather": "AW", "all-weather": "AW", "weatherproof": "AW",
+}
+
+# Known doormat dimensions in mm → force_size string. Matched via regex
+# below so variants like "60x40", "60 x 40 cm", "600x400mm", "600×400" all work.
+_DIM_TO_SIZE = {
+    (600, 400): "SMALL",
+    (700, 400): "MED",
+    (900, 600): "LAR",
+    (760, 460): "AW",
+}
+
+
+def detect_size_from_folder_name(title: str) -> str | None:
+    """Return a force_size string ('SMALL' / 'MED' / 'LAR' / 'AW') if the
+    folder title is a recognised size folder; otherwise None."""
+    t = normalise(title)
+    # Direct named match
+    if t in SIZE_FOLDER_MAP:
+        return SIZE_FOLDER_MAP[t]
+    # Dimension match: e.g. "60x40", "60 x 40 cm", "600x400mm", "900×600"
+    dim_match = re.fullmatch(
+        r"\s*(\d{2,3})\s*[x×]\s*(\d{2,3})\s*(cm|mm)?\s*",
+        t,
+    )
+    if dim_match:
+        w = int(dim_match.group(1))
+        h = int(dim_match.group(2))
+        unit = dim_match.group(3) or ""
+        # Convert cm to mm when needed
+        if w < 100 and h < 100 and unit != "mm":   # looks like cm
+            w *= 10
+            h *= 10
+        return _DIM_TO_SIZE.get((w, h))
+    return None
 
 MONTH_NAMES = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
@@ -121,6 +173,7 @@ log = logging.getLogger("drive_watcher")
 _SERVICE = None
 _METADATA_CACHE: dict = {}  # fileId -> {title, parents, mimeType, shortcut_target}
 _PARENT_CLASSIFICATION_CACHE: dict = {}  # parentId -> "skip" | "ok" | title
+_PROCESSED_FOLDER_CACHE: dict = {}  # parentId -> "Processed" subfolder id (or "" if absent)
 
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -235,6 +288,10 @@ def classify_title(title: str, current_year: int, current_month: int) -> str:
         if frag in t:
             return "reject-skiplist"
 
+    # Exact-match skip titles (for common words like "processed")
+    if t in EXACT_SKIP_TITLES:
+        return "reject-skiplist"
+
     # Strip common surrounding punctuation before parsing
     core = re.sub(r"[\[\]()_]", " ", t).strip()
     core = re.sub(r"\s+", " ", core)
@@ -326,12 +383,17 @@ def classify_title(title: str, current_year: int, current_month: int) -> str:
 
 # ── Parent chain walk ─────────────────────────────────────────────────────────
 
-def walk_chain(file_meta: dict, current_year: int, current_month: int) -> tuple[str | None, str | None]:
+def walk_chain(file_meta: dict, current_year: int, current_month: int) -> tuple[str | None, str | None, str | None]:
     """Walk parents until we hit a known Print root or run out.
 
-    Returns (root_title, reject_reason):
-      - (root_title, None)   — file is in a watched tree and passes filters
-      - (None, reason)       — file should be skipped ('not-in-tree', 'reject-...', 'shortcut-failed', 'too-deep')
+    Returns (root_title, force_size, reject_reason):
+      - (root_title, force_size_or_None, None)   — file is in a watched tree and passes filters
+      - (None, None, reason)                     — file should be skipped
+
+    force_size is derived from the first size-folder encountered during the
+    walk (e.g. "SMALL" for a "60x40" or "Small" folder). None if no size
+    folder was found — the caller can fall back to root-based or filename-based
+    size detection.
     """
     meta = resolve_shortcut(file_meta)
     hops = 0
@@ -340,8 +402,10 @@ def walk_chain(file_meta: dict, current_year: int, current_month: int) -> tuple[
 
     # Start from the immediate parent
     if not parents:
-        return None, "no-parents"
+        return None, None, "no-parents"
     current_id = parents[0]
+
+    detected_force_size: str | None = None
 
     while hops < MAX_WALK_HOPS:
         hops += 1
@@ -349,33 +413,38 @@ def walk_chain(file_meta: dict, current_year: int, current_month: int) -> tuple[
         # Check the parent classification cache first
         cached = _PARENT_CLASSIFICATION_CACHE.get(current_id)
         if cached == "skip":
-            return None, "reject-skiplist-cached"
+            return None, None, "reject-skiplist-cached"
 
         parent_meta = get_metadata(current_id)
         if parent_meta is None:
-            return None, "parent-fetch-failed"
+            return None, None, "parent-fetch-failed"
 
         title = parent_meta.get("name") or parent_meta.get("title", "")
+
+        # Record the first size-folder hint we see (closest to the file wins)
+        if detected_force_size is None:
+            size_hint = detect_size_from_folder_name(title)
+            if size_hint:
+                detected_force_size = size_hint
 
         # Classify
         classification = classify_title(title, current_year, current_month)
         if classification.startswith("reject"):
-            # Cache this parent as "skip" so future siblings short-circuit
             if classification == "reject-skiplist":
                 _PARENT_CLASSIFICATION_CACHE[current_id] = "skip"
-            return None, classification
+            return None, None, classification
 
         # Stop if we've hit a watched root
         if title in ALL_PRINT_ROOTS:
-            return title, None
+            return title, detected_force_size, None
 
         # Step up
         grandparents = parent_meta.get("parents", [])
         if not grandparents:
-            return None, "not-in-tree"
+            return None, None, "not-in-tree"
         current_id = grandparents[0]
 
-    return None, "too-deep"
+    return None, None, "too-deep"
 
 
 # ── State persistence ─────────────────────────────────────────────────────────
@@ -481,22 +550,24 @@ def trash_file(file_id: str) -> bool:
         return False
 
 
+def _escape_drive_query(s: str) -> str:
+    """Escape single quotes for use inside a Drive API v3 query string."""
+    return s.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def file_already_processed(parent_id: str, stem: str) -> bool:
     """Check whether <stem>_p.pdf already exists in the same parent folder."""
     svc = get_drive_service()
+    safe_stem = _escape_drive_query(stem)
     try:
         q = (
             f"'{parent_id}' in parents"
-            f" and name = '{stem}_p.pdf'"
+            f" and name = '{safe_stem}_p.pdf'"
             " and trashed = false"
         )
         resp = svc.files().list(
-            q=q,
-            fields="files(id)",
-            pageSize=1,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            corpora="allDrives",
+            q=q, fields="files(id)", pageSize=1,
+            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives",
         ).execute()
         return len(resp.get("files", [])) > 0
     except HttpError as e:
@@ -504,40 +575,124 @@ def file_already_processed(parent_id: str, stem: str) -> bool:
         return False
 
 
+def find_processed_subfolder(parent_id: str) -> str | None:
+    """Return the ID of the 'Processed' subfolder inside parent_id, or None if absent."""
+    cached = _PROCESSED_FOLDER_CACHE.get(parent_id)
+    if cached is not None:
+        return cached or None   # "" → not found
+
+    svc = get_drive_service()
+    try:
+        q = (
+            f"'{parent_id}' in parents"
+            f" and name = '{PROCESSED_SUBFOLDER_NAME}'"
+            f" and mimeType = 'application/vnd.google-apps.folder'"
+            f" and trashed = false"
+        )
+        resp = svc.files().list(
+            q=q, fields="files(id,name)", pageSize=1,
+            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives",
+        ).execute()
+        files = resp.get("files", [])
+        if files:
+            folder_id = files[0]["id"]
+            _PROCESSED_FOLDER_CACHE[parent_id] = folder_id
+            return folder_id
+    except HttpError as e:
+        log.warning(f"find_processed_subfolder failed: {e}")
+
+    _PROCESSED_FOLDER_CACHE[parent_id] = ""
+    return None
+
+
+def get_or_create_processed_subfolder(parent_id: str) -> str | None:
+    """Find or create the 'Processed' subfolder inside parent_id. Returns its ID."""
+    existing = find_processed_subfolder(parent_id)
+    if existing:
+        return existing
+
+    svc = get_drive_service()
+    try:
+        body = {
+            "name": PROCESSED_SUBFOLDER_NAME,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+        created = svc.files().create(
+            body=body, fields="id,name", supportsAllDrives=True,
+        ).execute()
+        folder_id = created["id"]
+        _PROCESSED_FOLDER_CACHE[parent_id] = folder_id
+        log.info(f"Created '{PROCESSED_SUBFOLDER_NAME}' subfolder (id={folder_id})")
+        return folder_id
+    except HttpError as e:
+        log.error(f"Could not create Processed subfolder: {e}")
+        return None
+
+
+def move_file_to_processed(file_id: str, current_parent_id: str) -> bool:
+    """Move file from current_parent_id into current_parent_id's Processed subfolder.
+    Creates the Processed subfolder if it doesn't exist. Returns True on success."""
+    processed_id = get_or_create_processed_subfolder(current_parent_id)
+    if not processed_id:
+        return False
+
+    svc = get_drive_service()
+    try:
+        svc.files().update(
+            fileId=file_id,
+            addParents=processed_id,
+            removeParents=current_parent_id,
+            fields="id,parents",
+            supportsAllDrives=True,
+        ).execute()
+        return True
+    except HttpError as e:
+        log.error(f"Move to Processed failed for {file_id}: {e}")
+        return False
+
+
 # ── Core processing ───────────────────────────────────────────────────────────
 
-def process_one(file_meta: dict, root_title: str) -> tuple[bool, str]:
-    """Download, process with vectorize_v2.py, upload result, delete original.
+def process_one(file_meta: dict, root_title: str, force_size: str | None = None) -> tuple[bool, str]:
+    """Download, process with vectorize_v2.py, upload the _p.pdf back to the
+    SAME folder as the original, then archive the original into a 'Processed'
+    subfolder.
+
+    force_size: override size (SMALL/MED/LAR/AW) — typically derived from the
+    folder name during chain walk. Falls back to AW if in an AW root, else
+    vectorize_v2's filename-based legacy logic.
 
     Returns (success, description_for_summary).
     """
     file_id = file_meta["id"]
     name = file_meta["name"]
-    stem, ext = os.path.splitext(name)
+    stem, _ext = os.path.splitext(name)
 
-    # Immediate parent of the ORIGINAL file (so we upload back to same folder)
     original_meta = resolve_shortcut(file_meta)
     parents = original_meta.get("parents", [])
     if not parents:
         return False, f"{name}: no parent"
     parent_id = parents[0]
 
-    # Skip if _p.pdf already exists in the same folder
+    # Skip if <stem>_p.pdf already exists in the same folder
     if file_already_processed(parent_id, stem):
         log.info(f"  {name}: _p.pdf already exists, skipping")
         return False, f"{name}: already processed"
 
-    # Download to tmp
+    # Decide size: explicit folder-derived > AW from root > filename legacy (None)
+    effective_force_size = force_size
+    if effective_force_size is None and root_title in AW_PRINT_ROOTS:
+        effective_force_size = "AW"
+
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, name)
         if not download_file(file_id, input_path):
             return False, f"{name}: download failed"
 
-        # Process via vectorize_v2
         output_path = os.path.join(tmpdir, f"{stem}_p.pdf")
-        force_size = "AW" if root_title in AW_PRINT_ROOTS else None
         try:
-            process_pdf(input_path, output_path=output_path, dpi=300, force_size=force_size)
+            process_pdf(input_path, output_path=output_path, dpi=300, force_size=effective_force_size)
         except Exception as e:
             log.error(f"  {name}: processing error: {e}")
             return False, f"{name}: process error: {e}"
@@ -545,19 +700,26 @@ def process_one(file_meta: dict, root_title: str) -> tuple[bool, str]:
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
             return False, f"{name}: output missing"
 
-        # Upload result
+        size_mb = os.path.getsize(input_path) / 1024 / 1024
+
+        # Upload _p.pdf alongside the original (same parent folder)
         uploaded_id = upload_file(output_path, parent_id, f"{stem}_p.pdf")
         if not uploaded_id:
             return False, f"{name}: upload failed"
 
-        # Trash original
-        if not trash_file(file_id):
-            log.warning(f"  {name}: uploaded but could not trash original")
-            return True, f"{name}: done (original not removed)"
+    # Archive the original into the Processed subfolder (non-destructive)
+    archive_enabled = os.environ.get("ARCHIVE_ORIGINALS", "true").lower() != "false"
+    archive_msg = ""
+    if archive_enabled:
+        if move_file_to_processed(file_id, parent_id):
+            archive_msg = " (original → Processed/)"
+        else:
+            archive_msg = " (original kept, archive move failed)"
+    else:
+        archive_msg = " (original kept, ARCHIVE_ORIGINALS=false)"
 
-    size_mb = (os.path.getsize(input_path) / 1024 / 1024) if os.path.exists(input_path) else 0
-    log.info(f"  ✓ {name} ({size_mb:.1f} MB) → {stem}_p.pdf")
-    return True, f"{name} → {stem}_p.pdf"
+    log.info(f"  ✓ {name} ({size_mb:.1f} MB, size={effective_force_size or 'auto'}) → {stem}_p.pdf{archive_msg}")
+    return True, f"{name} → {stem}_p.pdf{archive_msg}"
 
 
 def cycle() -> dict:
@@ -590,11 +752,11 @@ def cycle() -> dict:
         if f["name"].endswith("_p.pdf"):
             continue
 
-        root_title, reason = walk_chain(f, current_year, current_month)
+        root_title, force_size, reason = walk_chain(f, current_year, current_month)
         if root_title is None:
             log.debug(f"  skip {f['name']}: {reason}")
             continue
-        kept.append((f, root_title))
+        kept.append((f, root_title, force_size))
 
     stats["filtered_in"] = len(kept)
 
@@ -603,8 +765,8 @@ def cycle() -> dict:
         log.info(f"  cycle cap: processing {MAX_FILES_PER_CYCLE} of {len(kept)} candidates; rest next cycle")
         kept = kept[:MAX_FILES_PER_CYCLE]
 
-    for f, root_title in kept:
-        ok, desc = process_one(f, root_title)
+    for f, root_title, force_size in kept:
+        ok, desc = process_one(f, root_title, force_size=force_size)
         if ok:
             stats["processed"] += 1
             stats["processed_details"].append(desc)
