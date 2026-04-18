@@ -2,3 +2,13 @@ LabelMover-v1/
 projects/
 __pycache__/
 *.pyc
+
+# OAuth secrets — never commit
+oauth_client.json
+oauth_token.json
+
+# Watcher runtime files
+last_scan.json
+drive_watcher.log
+reprocess.log
+inversion_scan_results.csv

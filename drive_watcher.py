@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
@@ -122,8 +123,26 @@ _METADATA_CACHE: dict = {}  # fileId -> {title, parents, mimeType, shortcut_targ
 _PARENT_CLASSIFICATION_CACHE: dict = {}  # parentId -> "skip" | "ok" | title
 
 
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
 def get_drive_service():
-    """Authenticate with service account and return the Drive v3 service."""
+    """Authenticate and return the Drive v3 service.
+
+    Accepts either:
+    - Service account JSON (works for read, FAILS for upload due to quota)
+    - OAuth user credentials JSON with refresh_token (recommended for upload)
+
+    The OAuth user flavour is produced by running authorize.py once on the
+    user's PC. It looks like:
+        {
+          "type": "oauth_user",
+          "refresh_token": "1//...",
+          "client_id": "...apps.googleusercontent.com",
+          "client_secret": "...",
+          "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    """
     global _SERVICE
     if _SERVICE is not None:
         return _SERVICE
@@ -132,16 +151,37 @@ def get_drive_service():
     if not creds_json:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var not set")
 
-    # Accept either a JSON string or a path to a JSON file
     if creds_json.strip().startswith("{"):
         info = json.loads(creds_json)
     else:
         with open(creds_json, "r") as f:
             info = json.load(f)
 
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive"]
-    )
+    cred_type = info.get("type", "")
+
+    if cred_type == "service_account":
+        # Service account — works for read-only but CAN'T upload (no quota).
+        # Use OAuth user credentials for full read/write.
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        log.warning(
+            "Using service account credentials — uploads will fail due to storage quota. "
+            "Run authorize.py to generate OAuth user credentials for full read/write."
+        )
+    elif cred_type == "oauth_user" or "refresh_token" in info:
+        creds = UserCredentials(
+            token=None,
+            refresh_token=info["refresh_token"],
+            token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=info["client_id"],
+            client_secret=info["client_secret"],
+            scopes=SCOPES,
+        )
+    else:
+        raise RuntimeError(
+            f"GOOGLE_CREDENTIALS_JSON has unrecognised type={cred_type!r}. "
+            "Expected 'service_account' or 'oauth_user'."
+        )
+
     _SERVICE = build("drive", "v3", credentials=creds, cache_discovery=False)
     return _SERVICE
 
