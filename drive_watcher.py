@@ -199,6 +199,10 @@ def classify_title(title: str, current_year: int, current_month: int) -> str:
     core = re.sub(r"[\[\]()_]", " ", t).strip()
     core = re.sub(r"\s+", " ", core)
 
+    # Size name
+    if core in SIZE_TITLES:
+        return "transparent"
+
     # Full 4-digit year only (e.g. "2026")
     if re.fullmatch(r"20\d{2}", core):
         year = int(core)
@@ -213,12 +217,8 @@ def classify_title(title: str, current_year: int, current_month: int) -> str:
         m = int(core)
         return "transparent" if m == current_month else "reject-month"
 
-    # Size name
-    if core in SIZE_TITLES:
-        return "transparent"
-
-    # Combined month + year (any order, any separator)
-    # Try to extract a year (4-digit or 2-digit after 20) AND a month (name or numeric)
+    # Combined month + year parsing (any order, any separator).
+    # Strategy: find month and year independently, then cross-check.
     found_year = None
     found_month = None
 
@@ -227,46 +227,51 @@ def classify_title(title: str, current_year: int, current_month: int) -> str:
     if m4:
         found_year = int(m4.group(1))
 
-    # 2-digit year — only treat as year if adjacent to a month token
-    # Example: "APRIL 26", "Apr-26", "March 26"
-    # We match patterns like "<monthname> <2digit>" or "<2digit> <monthname>"
-    two_digit_pat = r"(?<!\d)(\d{2})(?!\d)"
-    if found_year is None:
-        for mname in MONTH_NAMES:
-            # look for monthname followed by a 2-digit year or preceded by one
-            for pattern in [rf"\b{mname}\b[\s\-_/]*{two_digit_pat}",
-                            rf"{two_digit_pat}[\s\-_/]*\b{mname}\b"]:
-                m = re.search(pattern, core)
-                if m:
-                    found_year = 2000 + int(m.group(1))
-                    break
-            if found_year is not None:
-                break
-
-    # Find month: name first
+    # Month name
     for mname, mnum in MONTH_NAMES.items():
         if re.search(rf"\b{re.escape(mname)}\b", core):
             found_month = mnum
             break
 
-    # Or numeric month from YYYY-MM / YYYY_MM / YYYY/MM or MM-YYYY
-    if found_month is None:
-        mm = re.search(r"(20\d{2})[\-_/](0?[1-9]|1[0-2])\b", core)
-        if mm:
-            found_month = int(mm.group(2))
-        else:
-            mm2 = re.search(r"\b(0?[1-9]|1[0-2])[\-_/](20\d{2})\b", core)
-            if mm2:
-                found_month = int(mm2.group(1))
+    # Redundant numeric-month prefix — e.g. "04 Apr" or "03 March".
+    # The digits at the start match the month number; treat the digits as
+    # redundant (not a year) to avoid "04 Apr" being read as year 2004.
+    redundant_prefix_len = 0
+    if found_month is not None:
+        prefix_match = re.match(r"^(0?\d{1,2})\s+", core)
+        if prefix_match:
+            prefix_num = int(prefix_match.group(1))
+            if 1 <= prefix_num <= 12 and prefix_num == found_month:
+                redundant_prefix_len = len(prefix_match.group(0))
 
-    # Also match leading numeric-month prefix like "03 March"
+    # 2-digit year adjacent to a month name (e.g. "APRIL 26" → 2026).
+    # Skip any redundant prefix (see above) and only accept 2-digit numbers
+    # >12 so they can't collide with month numbers.
+    if found_year is None and found_month is not None:
+        search_space = core[redundant_prefix_len:] if redundant_prefix_len else core
+        for mname in MONTH_NAMES:
+            for pattern in [
+                rf"\b{re.escape(mname)}\b[\s\-_/]*(\d{{2}})(?!\d)",
+                rf"(?<!\d)(\d{{2}})[\s\-_/]*\b{re.escape(mname)}\b",
+            ]:
+                m = re.search(pattern, search_space)
+                if m:
+                    yy = int(m.group(1))
+                    if yy >= 13:   # disambiguate: 01-12 is a month, >12 is a year
+                        found_year = 2000 + yy
+                        break
+            if found_year is not None:
+                break
+
+    # ISO-style YYYY-MM or reverse MM-YYYY
     if found_month is None:
-        mm3 = re.search(r"^(0[1-9]|1[0-2])\s+([a-z]+)", core)
-        if mm3:
-            m_num = int(mm3.group(1))
-            m_name = mm3.group(2)
-            if m_name in MONTH_NAMES and MONTH_NAMES[m_name] == m_num:
-                found_month = m_num
+        iso = re.search(r"(20\d{2})[\-_/](0?[1-9]|1[0-2])(?!\d)", core)
+        if iso:
+            found_month = int(iso.group(2))
+        else:
+            rev = re.search(r"(?<!\d)(0?[1-9]|1[0-2])[\-_/](20\d{2})", core)
+            if rev:
+                found_month = int(rev.group(1))
 
     if found_year is not None or found_month is not None:
         if found_year is not None and found_year != current_year:
