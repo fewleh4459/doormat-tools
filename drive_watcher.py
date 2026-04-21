@@ -630,12 +630,17 @@ def get_or_create_processed_subfolder(parent_id: str) -> str | None:
         return None
 
 
-def move_file_to_processed(file_id: str, current_parent_id: str) -> bool:
-    """Move file from current_parent_id into current_parent_id's Processed subfolder.
-    Creates the Processed subfolder if it doesn't exist. Returns True on success."""
+def move_file_to_processed(file_id: str, current_parent_id: str) -> tuple[bool, str]:
+    """Move file from current_parent_id into current_parent_id's Originals subfolder.
+    Creates the Originals subfolder if it doesn't exist.
+
+    Returns (ok, detail) where detail is a short human-readable reason when the
+    move fails. Empty string on success. Previously returned plain bool, which
+    meant the underlying HttpError (scope issue, permission, shared-drive quirk)
+    was logged but never surfaced in the email summary."""
     processed_id = get_or_create_processed_subfolder(current_parent_id)
     if not processed_id:
-        return False
+        return False, "could not find/create Originals subfolder"
 
     svc = get_drive_service()
     try:
@@ -646,24 +651,49 @@ def move_file_to_processed(file_id: str, current_parent_id: str) -> bool:
             fields="id,parents",
             supportsAllDrives=True,
         ).execute()
-        return True
+        return True, ""
     except HttpError as e:
+        # Extract the most useful bit of the HttpError: status + first reason.
+        status = getattr(getattr(e, "resp", None), "status", "?")
+        try:
+            err_body = json.loads(e.content.decode("utf-8")) if e.content else {}
+            errors = err_body.get("error", {}).get("errors", [])
+            reason = errors[0].get("reason", "") if errors else ""
+            message = err_body.get("error", {}).get("message", "")
+            detail = f"HTTP {status} {reason}: {message}".strip(": ")
+        except Exception:
+            detail = f"HTTP {status}: {e}"
+        log.error(f"Move to Originals failed for {file_id}: {detail}")
+        return False, detail
+    except Exception as e:
         log.error(f"Move to Originals failed for {file_id}: {e}")
-        return False
+        return False, str(e)
 
 
 # ── Core processing ───────────────────────────────────────────────────────────
 
-def process_one(file_meta: dict, root_title: str, force_size: str | None = None) -> tuple[bool, str]:
+# Outcome categories for a single file. "skipped" means we intentionally did
+# nothing (e.g. companion _p.pdf already exists) — it must NOT be counted as
+# an error, otherwise the watermark never advances and the same files get
+# re-scanned every cycle, causing email spam.
+OUTCOME_PROCESSED = "processed"
+OUTCOME_SKIPPED = "skipped"
+OUTCOME_ERROR = "error"
+
+
+def process_one(
+    file_meta: dict, root_title: str, force_size: str | None = None
+) -> tuple[str, str]:
     """Download, process with vectorize_v2.py, upload the _p.pdf back to the
-    SAME folder as the original, then archive the original into a 'Processed'
+    SAME folder as the original, then archive the original into an 'Originals'
     subfolder.
 
     force_size: override size (SMALL/MED/LAR/AW) — typically derived from the
     folder name during chain walk. Falls back to AW if in an AW root, else
     vectorize_v2's filename-based legacy logic.
 
-    Returns (success, description_for_summary).
+    Returns (outcome, description_for_summary) where outcome is one of
+    OUTCOME_PROCESSED / OUTCOME_SKIPPED / OUTCOME_ERROR.
     """
     file_id = file_meta["id"]
     name = file_meta["name"]
@@ -672,13 +702,15 @@ def process_one(file_meta: dict, root_title: str, force_size: str | None = None)
     original_meta = resolve_shortcut(file_meta)
     parents = original_meta.get("parents", [])
     if not parents:
-        return False, f"{name}: no parent"
+        return OUTCOME_ERROR, f"{name}: no parent"
     parent_id = parents[0]
 
-    # Skip if <stem>_p.pdf already exists in the same folder
+    # Skip (not error) if <stem>_p.pdf already exists in the same folder.
+    # This is an expected steady-state once processed files haven't been
+    # archived yet — treating it as an error caused runaway re-polling.
     if file_already_processed(parent_id, stem):
         log.info(f"  {name}: _p.pdf already exists, skipping")
-        return False, f"{name}: already processed"
+        return OUTCOME_SKIPPED, f"{name}: already processed (skipped)"
 
     # Decide size: explicit folder-derived > AW from root > filename legacy (None)
     effective_force_size = force_size
@@ -688,38 +720,42 @@ def process_one(file_meta: dict, root_title: str, force_size: str | None = None)
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, name)
         if not download_file(file_id, input_path):
-            return False, f"{name}: download failed"
+            return OUTCOME_ERROR, f"{name}: download failed"
 
         output_path = os.path.join(tmpdir, f"{stem}_p.pdf")
         try:
             process_pdf(input_path, output_path=output_path, dpi=150, force_size=effective_force_size)
         except Exception as e:
             log.error(f"  {name}: processing error: {e}")
-            return False, f"{name}: process error: {e}"
+            return OUTCOME_ERROR, f"{name}: process error: {e}"
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            return False, f"{name}: output missing"
+            return OUTCOME_ERROR, f"{name}: output missing"
 
         size_mb = os.path.getsize(input_path) / 1024 / 1024
 
         # Upload _p.pdf alongside the original (same parent folder)
         uploaded_id = upload_file(output_path, parent_id, f"{stem}_p.pdf")
         if not uploaded_id:
-            return False, f"{name}: upload failed"
+            return OUTCOME_ERROR, f"{name}: upload failed"
 
-    # Archive the original into the Processed subfolder (non-destructive)
+    # Archive the original into the Originals subfolder (non-destructive).
+    # Archive failure is still a successful processing — we keep the _p.pdf —
+    # but we now include the specific reason in the summary so the failure
+    # mode is visible instead of hidden in the logs.
     archive_enabled = os.environ.get("ARCHIVE_ORIGINALS", "true").lower() != "false"
     archive_msg = ""
     if archive_enabled:
-        if move_file_to_processed(file_id, parent_id):
+        ok, reason = move_file_to_processed(file_id, parent_id)
+        if ok:
             archive_msg = " (original → Originals/)"
         else:
-            archive_msg = " (original kept, archive move failed)"
+            archive_msg = f" (original kept, archive move FAILED: {reason or 'unknown'})"
     else:
         archive_msg = " (original kept, ARCHIVE_ORIGINALS=false)"
 
     log.info(f"  ✓ {name} ({size_mb:.1f} MB, size={effective_force_size or 'auto'}) → {stem}_p.pdf{archive_msg}")
-    return True, f"{name} → {stem}_p.pdf{archive_msg}"
+    return OUTCOME_PROCESSED, f"{name} → {stem}_p.pdf{archive_msg}"
 
 
 def cycle() -> dict:
@@ -735,9 +771,11 @@ def cycle() -> dict:
         "found": 0,
         "filtered_in": 0,
         "processed": 0,
+        "skipped": 0,
         "errors": 0,
         "error_details": [],
         "processed_details": [],
+        "skipped_details": [],
     }
 
     candidates = find_candidate_files(since)
@@ -766,15 +804,21 @@ def cycle() -> dict:
         kept = kept[:MAX_FILES_PER_CYCLE]
 
     for f, root_title, force_size in kept:
-        ok, desc = process_one(f, root_title, force_size=force_size)
-        if ok:
+        outcome, desc = process_one(f, root_title, force_size=force_size)
+        if outcome == OUTCOME_PROCESSED:
             stats["processed"] += 1
             stats["processed_details"].append(desc)
+        elif outcome == OUTCOME_SKIPPED:
+            stats["skipped"] += 1
+            stats["skipped_details"].append(desc)
         else:
             stats["errors"] += 1
             stats["error_details"].append(desc)
 
-    # Only advance last_scan if we fully processed everything we wanted to
+    # Advance the watermark unless a real error occurred. Skipped files (e.g.
+    # orphaned originals whose _p.pdf companion already exists) must NOT block
+    # the watermark — otherwise the same files keep getting re-scanned every
+    # cycle and every email summary repeats them indefinitely.
     if stats["errors"] == 0:
         save_last_scan_time(now)
 
@@ -812,15 +856,19 @@ def main():
     while True:
         try:
             stats = cycle()
+            # Only email if something substantive happened. Pure-skipped cycles
+            # (e.g. same orphaned _p.pdf sitting there) stay silent — logged
+            # once, but no email spam.
             if stats["processed"] > 0 or stats["errors"] > 0:
                 log.info(
                     f"cycle: found={stats['found']} kept={stats['filtered_in']}"
-                    f" processed={stats['processed']} errors={stats['errors']}"
+                    f" processed={stats['processed']} skipped={stats['skipped']} errors={stats['errors']}"
                 )
-                # Email summary — only if something actually happened
                 body_parts = []
                 if stats["processed_details"]:
                     body_parts.append("Processed:\n" + "\n".join(f"  - {d}" for d in stats["processed_details"]))
+                if stats["skipped_details"]:
+                    body_parts.append("Skipped:\n" + "\n".join(f"  - {d}" for d in stats["skipped_details"]))
                 if stats["error_details"]:
                     body_parts.append("Errors:\n" + "\n".join(f"  - {d}" for d in stats["error_details"]))
                 send_summary(
@@ -830,6 +878,12 @@ def main():
                     folders=[],
                     body_extra="\n\n".join(body_parts),
                     silent_if_empty=True,
+                )
+            elif stats["skipped"] > 0:
+                # Log-only: note skips at debug level so they don't spam stdout.
+                log.debug(
+                    f"cycle: found={stats['found']} kept={stats['filtered_in']}"
+                    f" skipped={stats['skipped']} (no new work)"
                 )
         except KeyboardInterrupt:
             log.info("Interrupted, exiting")
