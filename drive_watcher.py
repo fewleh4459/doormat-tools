@@ -631,29 +631,66 @@ def get_or_create_processed_subfolder(parent_id: str) -> str | None:
 
 
 def move_file_to_processed(file_id: str, current_parent_id: str) -> tuple[bool, str]:
-    """Move file from current_parent_id into current_parent_id's Originals subfolder.
-    Creates the Originals subfolder if it doesn't exist.
+    """Move `file_id` into `current_parent_id`'s Originals subfolder.
 
-    Returns (ok, detail) where detail is a short human-readable reason when the
-    move fails. Empty string on success. Previously returned plain bool, which
-    meant the underlying HttpError (scope issue, permission, shared-drive quirk)
-    was logged but never surfaced in the email summary."""
+    Fetches the file's CURRENT parents fresh (not the ones from the search
+    query, which can be stale if the file has moved during the processing
+    cycle) and removes all of them while adding the target. This avoids the
+    "Increasing the number of parents is not allowed" API error that occurs
+    when `removeParents=X` is a no-op (because X is no longer a parent) and
+    `addParents=Y` would take the total above 1 — Google deprecated multi-
+    parent files in 2020, so any update that leaves >1 parent is rejected.
+
+    Also short-circuits if the file is already in the target Originals folder
+    (e.g. moved by a previous cycle or another watcher instance).
+
+    Returns (ok, detail) where `detail` is a short human-readable reason when
+    the move fails (empty string on success).
+    """
     processed_id = get_or_create_processed_subfolder(current_parent_id)
     if not processed_id:
         return False, "could not find/create Originals subfolder"
 
     svc = get_drive_service()
+
+    # Fetch the file's current parents fresh. Drive's search query can return
+    # stale parent info, and the file may also have been moved between the
+    # search and now (by another cycle, another watcher instance, or manually).
+    try:
+        fresh = svc.files().get(
+            fileId=file_id,
+            fields="id,parents,trashed",
+            supportsAllDrives=True,
+        ).execute()
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", "?")
+        return False, f"could not fetch current parents (HTTP {status})"
+
+    if fresh.get("trashed"):
+        return False, "file has been trashed"
+
+    actual_parents = fresh.get("parents") or []
+    if not actual_parents:
+        return False, "file has no parents (orphaned?)"
+
+    # Short-circuit: already in the target folder.
+    if processed_id in actual_parents and len(actual_parents) == 1:
+        return True, ""
+
+    # Remove ALL current parents; add the target. Drive requires exactly one
+    # parent post-update, so this single call atomically performs the move.
+    remove_list = ",".join(actual_parents)
+
     try:
         svc.files().update(
             fileId=file_id,
             addParents=processed_id,
-            removeParents=current_parent_id,
+            removeParents=remove_list,
             fields="id,parents",
             supportsAllDrives=True,
         ).execute()
         return True, ""
     except HttpError as e:
-        # Extract the most useful bit of the HttpError: status + first reason.
         status = getattr(getattr(e, "resp", None), "status", "?")
         try:
             err_body = json.loads(e.content.decode("utf-8")) if e.content else {}
