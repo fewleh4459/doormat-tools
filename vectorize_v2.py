@@ -195,7 +195,12 @@ def write_bw_vector_pdf(traced_path, output_path, page_size, bitmap_size):
 
 # ── Color enhancement pipeline ────────────────────────────────────────────────
 
-def boost_color_image_cmyk(img, ink_boost=1.5, black_threshold=60):
+def boost_color_image_cmyk(
+    img,
+    ink_boost=1.5,
+    black_brightness_max=40,
+    black_saturation_max=15,
+):
     """Boost color image directly in CMYK space for accurate print output.
 
     - Converts RGB to CMYK
@@ -204,17 +209,36 @@ def boost_color_image_cmyk(img, ink_boost=1.5, black_threshold=60):
     - White pixels left untouched
     - Returns a CMYK PIL image ready for PDF embedding
 
+    Near-black detection now requires BOTH low brightness AND low saturation
+    (channels close to each other). The previous check — each RGB channel
+    independently below 60 — was too loose: any dark hue whose three channels
+    all happened to be < 60 (e.g. navy RGB(30,30,50), forest RGB(20,50,20),
+    maroon RGB(50,20,20)) got swept in and flattened to pure rich black,
+    destroying the colour. The tighter rule preserves dark colours while
+    still catching actual near-black text/line art.
+
     ink_boost: multiplier for CMYK channel values (1.5 = 50% more ink)
+    black_brightness_max: brightest channel must be below this to count
+        as near-black (default 40 — conservative, only very dark pixels)
+    black_saturation_max: max-min channel spread must be below this; i.e.
+        the pixel must be close to neutral grey, not a dark hue (default 15)
     """
     # Convert to CMYK
     cmyk = img.convert("CMYK")
     arr = np.array(cmyk, dtype=np.float32)
 
-    # Also check original RGB for near-black detection
+    # Near-black detection on the original RGB:
+    #   is_dark    — brightest channel is below the brightness ceiling
+    #   is_neutral — channel spread (max - min) is small, so no strong hue
+    # Both must be true. A dark blue like (30, 30, 60) fails is_dark
+    # because max=60 > 40; a desaturated dark grey (30, 32, 35) passes
+    # because max=35 < 40 and spread=5 < 15.
     rgb = np.array(img)
-    near_black = (rgb[:, :, 0] < black_threshold) & \
-                 (rgb[:, :, 1] < black_threshold) & \
-                 (rgb[:, :, 2] < black_threshold)
+    channel_max = rgb.max(axis=2)
+    channel_min = rgb.min(axis=2)
+    is_dark = channel_max < black_brightness_max
+    is_neutral = (channel_max - channel_min) < black_saturation_max
+    near_black = is_dark & is_neutral
 
     # Detect white/near-white pixels (leave untouched)
     near_white = (rgb[:, :, 0] > 240) & \
