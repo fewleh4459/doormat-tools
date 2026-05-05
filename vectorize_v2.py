@@ -329,7 +329,6 @@ def process_pdf(input_path, output_path=None, dpi=150, force_size=None):
         write_color_pdf(img, output_path, page_size, dpi=dpi)
         # Explicitly free the large image buffer before leaving
         del img
-        import gc
         gc.collect()
     else:
         print(f"[B&W]   {basename} -> {w_mm}x{h_mm}mm ({size_tag}, {dpi} DPI)")
