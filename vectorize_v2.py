@@ -16,6 +16,7 @@ Size conventions (from filename):
 import sys
 import os
 import re
+import gc
 import glob as globmod
 import fitz  # PyMuPDF
 import numpy as np
@@ -223,10 +224,7 @@ def boost_color_image_cmyk(
     black_saturation_max: max-min channel spread must be below this; i.e.
         the pixel must be close to neutral grey, not a dark hue (default 15)
     """
-    # Convert to CMYK
-    cmyk = img.convert("CMYK")
-    arr = np.array(cmyk, dtype=np.float32)
-
+    # Compute masks from RGB first so we can free it before the large CMYK array.
     # Near-black detection on the original RGB:
     #   is_dark    — brightest channel is below the brightness ceiling
     #   is_neutral — channel spread (max - min) is small, so no strong hue
@@ -244,10 +242,19 @@ def boost_color_image_cmyk(
     near_white = (rgb[:, :, 0] > 240) & \
                  (rgb[:, :, 1] > 240) & \
                  (rgb[:, :, 2] > 240)
+    del rgb, channel_max, channel_min, is_dark, is_neutral  # free ~75 MB before CMYK alloc
 
-    # Boost all CMYK channels for colour pixels
     colour_mask = ~near_black & ~near_white
-    arr[colour_mask] = np.clip(arr[colour_mask] * ink_boost, 0, 255)
+
+    # uint16 instead of float32 — halves the array size (150 MB vs 300 MB for LRG at 150 DPI).
+    # Only boost-candidate pixels are temporarily promoted to float32 for the multiply.
+    cmyk = img.convert("CMYK")
+    arr = np.array(cmyk, dtype=np.uint16)
+    del cmyk  # free PIL CMYK copy now that we have the numpy array (~75 MB)
+
+    boosted = np.clip(arr[colour_mask].astype(np.float32) * ink_boost, 0, 255)
+    arr[colour_mask] = boosted.astype(np.uint16)
+    del boosted
 
     # Force near-black to rich black (all channels maxed)
     arr[near_black] = [255, 255, 255, 255]
@@ -327,14 +334,23 @@ def process_pdf(input_path, output_path=None, dpi=150, force_size=None):
     else:
         print(f"[B&W]   {basename} -> {w_mm}x{h_mm}mm ({size_tag}, {dpi} DPI)")
         img, _ = pdf_to_bitmap(input_path, dpi=dpi)
+        bmp_size = img.size
         traced = trace_bitmap(img)
-        write_bw_vector_pdf(traced, output_path, page_size, img.size)
+        del img   # free before writing vectors — inversion check re-reads from disk if needed
+        write_bw_vector_pdf(traced, output_path, page_size, bmp_size)
+        del traced
 
-        # Validate: check for inversion
+        # Validate: check for inversion; re-read input for fallback rather than
+        # keeping the large bitmap alive across the trace + write steps above.
         if _is_output_inverted(input_path, output_path):
             print(f"        !! Inversion detected — falling back to raster CMYK")
-            img_cmyk = boost_color_image_cmyk(img, ink_boost=1.0)
+            img_fallback, _ = pdf_to_bitmap(input_path, dpi=dpi)
+            img_cmyk = boost_color_image_cmyk(img_fallback, ink_boost=1.0)
+            del img_fallback
             write_color_pdf(img_cmyk, output_path, page_size, dpi=dpi)
+            del img_cmyk
+
+        gc.collect()
 
     out_kb = os.path.getsize(output_path) // 1024
     print(f"        -> {os.path.basename(output_path)} ({out_kb} KB)")
@@ -347,34 +363,35 @@ def generate_lrg_from_reg(reg_path, output_path, dpi=300):
     w_mm, h_mm = 900, 600
 
     has_color, _ = is_color_pdf(reg_path)
-    img, _ = pdf_to_bitmap(reg_path, dpi=dpi)
+    img, _ = pdf_to_bitmap(reg_path, dpi=150)  # always 150 DPI — output is capped at 150 anyway
 
     if has_color:
         img = boost_color_image_cmyk(img)
-        # Stretch to fill LRG artboard (different aspect ratio is acceptable)
-        target_w = int(page_w / 72 * 150)  # 150 DPI for color
-        target_h = int(page_h / 72 * 150)
-        img_stretched = img.resize((target_w, target_h), Image.LANCZOS)
-
         print(f"[COLOR-LRG] {basename} -> {w_mm}x{h_mm}mm (stretched to fill)")
-        write_color_pdf(img_stretched, output_path, SIZE_LRG, dpi=150)
+        write_color_pdf(img, output_path, SIZE_LRG, dpi=150)
+        del img
     else:
         # B&W: trace, then stretch vectors to fill LRG artboard
+        bmp_size = img.size
         traced = trace_bitmap(img)
-        write_bw_vector_pdf(traced, output_path, SIZE_LRG, img.size)
+        del img  # free before writing; re-read from disk if fallback needed
+        write_bw_vector_pdf(traced, output_path, SIZE_LRG, bmp_size)
+        del traced
 
         # Validate: check for inversion (compare to REG original)
         orig_ratio = _black_ratio(reg_path)
         out_ratio = _black_ratio(output_path)
         if (out_ratio - orig_ratio) > 0.30:
             print(f"        !! LRG inversion detected — falling back to raster CMYK")
-            img_cmyk = boost_color_image_cmyk(img, ink_boost=1.0)
-            target_w = int(page_w / 72 * 150)
-            target_h = int(page_h / 72 * 150)
-            img_stretched = img_cmyk.resize((target_w, target_h), Image.LANCZOS)
-            write_color_pdf(img_stretched, output_path, SIZE_LRG, dpi=150)
+            img_fallback, _ = pdf_to_bitmap(reg_path, dpi=150)
+            img_cmyk = boost_color_image_cmyk(img_fallback, ink_boost=1.0)
+            del img_fallback
+            write_color_pdf(img_cmyk, output_path, SIZE_LRG, dpi=150)
+            del img_cmyk
 
         print(f"[B&W-LRG]   {basename} -> {w_mm}x{h_mm}mm (stretched to fill)")
+
+    gc.collect()
 
     out_kb = os.path.getsize(output_path) // 1024
     print(f"             -> {os.path.basename(output_path)} ({out_kb} KB)")
