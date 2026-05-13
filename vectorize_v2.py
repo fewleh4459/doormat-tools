@@ -198,65 +198,86 @@ def write_bw_vector_pdf(traced_path, output_path, page_size, bitmap_size):
 
 def boost_color_image_cmyk(
     img,
-    ink_boost=1.5,
-    black_brightness_max=40,
-    black_saturation_max=15,
+    ink_boost=1.7,
+    black_brightness_max=90,
+    black_saturation_max=20,
+    k_extraction_brightness_max=200,
+    k_extraction_saturation_max=25,
+    k_extraction_factor=0.85,
 ):
     """Boost color image directly in CMYK space for accurate print output.
 
-    - Converts RGB to CMYK
-    - Near-black pixels → rich black (C=255, M=255, Y=255, K=255)
-    - Colour pixels → each CMYK channel boosted by ink_boost factor
-    - White pixels left untouched
-    - Returns a CMYK PIL image ready for PDF embedding
+    Two stages protect against weak prints on coir:
 
-    Near-black detection now requires BOTH low brightness AND low saturation
-    (channels close to each other). The previous check — each RGB channel
-    independently below 60 — was too loose: any dark hue whose three channels
-    all happened to be < 60 (e.g. navy RGB(30,30,50), forest RGB(20,50,20),
-    maroon RGB(50,20,20)) got swept in and flattened to pure rich black,
-    destroying the colour. The tighter rule preserves dark colours while
-    still catching actual near-black text/line art.
+    1. Force-to-rich-black: pixels that are clearly dark AND clearly neutral
+       (no strong hue) are slammed to C100 M100 Y100 K100. The neutral check
+       (small max-min channel spread on the ORIGINAL RGB) means dark hues
+       like navy (20,20,70), maroon (60,20,20) or forest (20,60,20) are
+       NOT swept up.
 
-    ink_boost: multiplier for CMYK channel values (1.5 = 50% more ink)
-    black_brightness_max: brightest channel must be below this to count
-        as near-black (default 40 — conservative, only very dark pixels)
-    black_saturation_max: max-min channel spread must be below this; i.e.
-        the pixel must be close to neutral grey, not a dark hue (default 15)
+    2. Black-plate extraction (UCR): PIL's RGB→CMYK conversion gives K=0
+       for every pixel, so "off-black" raster pixels that don't qualify
+       for rule 1 (anti-aliased icon bodies, PNG/JPEG compression artefacts,
+       slightly-grey source) end up as composite C+M+Y with no key plate
+       and print muddy/weak on coir. We extract a real K from min(CMY)
+       for dark, near-NEUTRAL pixels — gated on the ORIGINAL RGB spread
+       (not the post-boost CMY spread, which would falsely flag clipped
+       dark colours as neutral and pull the hue out of them).
+
+    Previous behaviour was too restrictive (brightness<40, spread<15) and
+    left dark grey raster content (e.g. paw-print PNGs) as K=0 composite
+    blacks — the "footprint icons print weak" symptom.
+
+    ink_boost: multiplier for CMYK channel values (1.7 = 70% more ink)
+    black_brightness_max: brightest RGB channel must be below this to
+        count as near-black (default 90)
+    black_saturation_max: RGB channel spread must be below this — pixel
+        must be near-neutral, not a dark hue (default 20)
+    k_extraction_brightness_max: outer band where UCR (black-plate
+        generation) can apply (default 200 — covers anti-aliased mid-greys)
+    k_extraction_saturation_max: original RGB spread ceiling for UCR — keeps
+        saturated colours intact (default 25)
+    k_extraction_factor: fraction of min(CMY) pulled into K (default 0.85)
     """
-    # Compute masks from RGB first so we can free it before the large CMYK array.
-    # Near-black detection on the original RGB:
-    #   is_dark    — brightest channel is below the brightness ceiling
-    #   is_neutral — channel spread (max - min) is small, so no strong hue
-    # Both must be true. A dark blue like (30, 30, 60) fails is_dark
-    # because max=60 > 40; a desaturated dark grey (30, 32, 35) passes
-    # because max=35 < 40 and spread=5 < 15.
     rgb = np.array(img)
     channel_max = rgb.max(axis=2)
     channel_min = rgb.min(axis=2)
-    is_dark = channel_max < black_brightness_max
-    is_neutral = (channel_max - channel_min) < black_saturation_max
-    near_black = is_dark & is_neutral
+    spread = channel_max - channel_min
 
-    # Detect white/near-white pixels (leave untouched)
+    near_black = (channel_max < black_brightness_max) & (spread < black_saturation_max)
     near_white = (rgb[:, :, 0] > 240) & \
                  (rgb[:, :, 1] > 240) & \
                  (rgb[:, :, 2] > 240)
-    del rgb, channel_max, channel_min, is_dark, is_neutral  # free ~75 MB before CMYK alloc
+
+    needs_k = (channel_max < k_extraction_brightness_max) \
+        & (spread < k_extraction_saturation_max) \
+        & ~near_black & ~near_white
+
+    del rgb, channel_max, channel_min, spread
 
     colour_mask = ~near_black & ~near_white
 
-    # uint16 instead of float32 — halves the array size (150 MB vs 300 MB for LRG at 150 DPI).
-    # Only boost-candidate pixels are temporarily promoted to float32 for the multiply.
     cmyk = img.convert("CMYK")
     arr = np.array(cmyk, dtype=np.uint16)
-    del cmyk  # free PIL CMYK copy now that we have the numpy array (~75 MB)
+    del cmyk
 
     boosted = np.clip(arr[colour_mask].astype(np.float32) * ink_boost, 0, 255)
     arr[colour_mask] = boosted.astype(np.uint16)
     del boosted
 
-    # Force near-black to rich black (all channels maxed)
+    if needs_k.any():
+        c_chan = arr[..., 0]
+        m_chan = arr[..., 1]
+        y_chan = arr[..., 2]
+        k_chan = arr[..., 3]
+        cmy_min = np.minimum(np.minimum(c_chan, m_chan), y_chan)
+        k_extract = (cmy_min[needs_k].astype(np.float32) * k_extraction_factor).astype(np.uint16)
+        c_chan[needs_k] = c_chan[needs_k] - k_extract
+        m_chan[needs_k] = m_chan[needs_k] - k_extract
+        y_chan[needs_k] = y_chan[needs_k] - k_extract
+        k_chan[needs_k] = np.maximum(k_chan[needs_k], k_extract)
+        del cmy_min
+
     arr[near_black] = [255, 255, 255, 255]
 
     return Image.fromarray(arr.astype(np.uint8), mode="CMYK")
