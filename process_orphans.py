@@ -204,21 +204,36 @@ def walk_statics(
         effective_size = local_size or size_hint
 
         # Single API call lists everything in this folder — so while we're here,
-        # build a set of "stems that already have a _p.pdf companion" and a set
-        # of ALL filenames. Attach both to each collected item so the caller can
-        # answer "is this already processed?" / "does this LRG name exist?"
-        # WITHOUT making a Drive API call per file (the previous design did one
-        # API call per file, which made the dry-run stall on large catalogues).
+        # build sets of "what already exists in here in any processed form".
+        # Three categories we care about:
+        #   - p_stems: stems with a "<stem>_p.pdf" sibling (watcher convention)
+        #   - all_names: every non-folder filename in this folder
+        #   - historical_processed: filenames inside a sibling "_RichBlack/"
+        #     subfolder. Historical statics batch processing wrote rich-black
+        #     PDFs into _RichBlack/ keeping the original filename, so a file
+        #     "CUS100 REG.pdf" at the top of _CUS Statics is "already processed"
+        #     if "CUS100 REG.pdf" exists inside _CUS Statics/_RichBlack/.
+        # All three sets are attached to every collected item so the caller can
+        # check membership in O(1) without making a Drive API call per file.
         children = list_children(folder_id)
         p_stems: set[str] = set()
         all_names: set[str] = set()
+        historical_processed: set[str] = set()
         for c in children:
             cn = c.get("name", "")
-            if c.get("mimeType") == "application/vnd.google-apps.folder":
+            cm = c.get("mimeType", "")
+            if cm == "application/vnd.google-apps.folder":
+                # Peek inside _RichBlack to learn what's already been processed
+                # historically. We do NOT descend into _RichBlack as a regular
+                # walk — it's pre-filtered by is_skipped_folder anyway.
+                if cn.lower() == "_richblack":
+                    for rb_child in list_children(c["id"]):
+                        rb_name = rb_child.get("name", "")
+                        if rb_name:
+                            historical_processed.add(rb_name)
                 continue
             all_names.add(cn)
             if cn.lower().endswith("_p.pdf"):
-                # strip "_p.pdf" → stem (case-insensitive on the suffix)
                 stem = cn[:-len("_p.pdf")]
                 p_stems.add(stem)
 
@@ -257,6 +272,7 @@ def walk_statics(
                 "root_title": root_title,
                 "_p_stems_in_folder": p_stems,   # in-memory set, no API calls
                 "_all_names_in_folder": all_names,
+                "_historical_processed_in_folder": historical_processed,
             })
 
     descend(root_folder_id, root_title, inside_statics=False, size_hint=None)
@@ -273,9 +289,15 @@ def process_orphan(item: dict, dry_run: bool) -> tuple[str, str]:
     file_id = item["id"]
     force_size = item["force_size"]
 
-    # In-memory check first (built during walk_statics, no API call).
-    # Falls back to the live API check only if the set wasn't supplied
-    # (defensive — keeps the function usable from places that don't pre-walk).
+    # Three in-memory checks (all built during walk_statics, no API calls):
+    #   1. Did historical batch processing already write this file into the
+    #      sibling _RichBlack/ subfolder? (true for the bulk of statics)
+    #   2. Does a "<stem>_p.pdf" sibling exist at top level? (watcher convention)
+    #   3. Fallback: API call if no sets were supplied (defensive)
+    historical = item.get("_historical_processed_in_folder", set())
+    if name in historical:
+        return "skipped", f"{name}: already in _RichBlack/"
+
     p_stems = item.get("_p_stems_in_folder")
     if p_stems is not None:
         if stem in p_stems:
@@ -359,12 +381,16 @@ def generate_missing_lrg(
             else:
                 lrg_name = f"{base} LRG{ext}"
 
-            # In-memory check — does an LRG (or LRG_p) already sit in this folder?
-            # Uses sets built during walk_statics, no API call.
+            # In-memory check — does an LRG already exist somewhere in this folder?
+            # Checks top-level files, top-level "<stem>_p.pdf" companions, AND
+            # the sibling _RichBlack/ subfolder (historical batch convention).
             all_names = reg_item.get("_all_names_in_folder", set())
             p_stems = reg_item.get("_p_stems_in_folder", set())
+            historical = reg_item.get("_historical_processed_in_folder", set())
             lrg_stem = os.path.splitext(lrg_name)[0]
-            if lrg_name in all_names or lrg_stem in p_stems:
+            if (lrg_name in all_names
+                or lrg_stem in p_stems
+                or lrg_name in historical):
                 results.append(("skipped", f"{sku}: LRG already present"))
                 continue
 
