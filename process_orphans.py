@@ -188,7 +188,26 @@ def walk_statics(
         local_size = detect_size_from_folder_name(folder_title)
         effective_size = local_size or size_hint
 
-        for child in list_children(folder_id):
+        # Single API call lists everything in this folder — so while we're here,
+        # build a set of "stems that already have a _p.pdf companion" and a set
+        # of ALL filenames. Attach both to each collected item so the caller can
+        # answer "is this already processed?" / "does this LRG name exist?"
+        # WITHOUT making a Drive API call per file (the previous design did one
+        # API call per file, which made the dry-run stall on large catalogues).
+        children = list_children(folder_id)
+        p_stems: set[str] = set()
+        all_names: set[str] = set()
+        for c in children:
+            cn = c.get("name", "")
+            if c.get("mimeType") == "application/vnd.google-apps.folder":
+                continue
+            all_names.add(cn)
+            if cn.lower().endswith("_p.pdf"):
+                # strip "_p.pdf" → stem (case-insensitive on the suffix)
+                stem = cn[:-len("_p.pdf")]
+                p_stems.add(stem)
+
+        for child in children:
             name = child.get("name", "")
             mime = child.get("mimeType", "")
 
@@ -221,6 +240,8 @@ def walk_statics(
                 "parent_title": folder_title,
                 "force_size": final_size,
                 "root_title": root_title,
+                "_p_stems_in_folder": p_stems,   # in-memory set, no API calls
+                "_all_names_in_folder": all_names,
             })
 
     descend(root_folder_id, root_title, inside_statics=False, size_hint=None)
@@ -237,7 +258,14 @@ def process_orphan(item: dict, dry_run: bool) -> tuple[str, str]:
     file_id = item["id"]
     force_size = item["force_size"]
 
-    if file_already_processed(parent_id, stem):
+    # In-memory check first (built during walk_statics, no API call).
+    # Falls back to the live API check only if the set wasn't supplied
+    # (defensive — keeps the function usable from places that don't pre-walk).
+    p_stems = item.get("_p_stems_in_folder")
+    if p_stems is not None:
+        if stem in p_stems:
+            return "skipped", f"{name}: _p.pdf already exists"
+    elif file_already_processed(parent_id, stem):
         return "skipped", f"{name}: _p.pdf already exists"
 
     if dry_run:
@@ -316,14 +344,17 @@ def generate_missing_lrg(
             else:
                 lrg_name = f"{base} LRG{ext}"
 
-            if dry_run:
-                results.append(("would-gen-lrg", f"{sku}: would generate {lrg_name}"))
+            # In-memory check — does an LRG (or LRG_p) already sit in this folder?
+            # Uses sets built during walk_statics, no API call.
+            all_names = reg_item.get("_all_names_in_folder", set())
+            p_stems = reg_item.get("_p_stems_in_folder", set())
+            lrg_stem = os.path.splitext(lrg_name)[0]
+            if lrg_name in all_names or lrg_stem in p_stems:
+                results.append(("skipped", f"{sku}: LRG already present"))
                 continue
 
-            # Skip if the LRG already exists in this folder (race with another run)
-            if file_already_processed(parent_id, os.path.splitext(lrg_name)[0]) or \
-               _lrg_already_exists(parent_id, lrg_name):
-                results.append(("skipped", f"{sku}: LRG already present"))
+            if dry_run:
+                results.append(("would-gen-lrg", f"{sku}: would generate {lrg_name}"))
                 continue
 
             with tempfile.TemporaryDirectory() as tmpdir:
