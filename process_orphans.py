@@ -75,14 +75,46 @@ def is_statics_folder(name: str) -> bool:
     return "static" in normalise(name)
 
 
+REQUIRED_PARENT_FRAGMENT = "job bag"  # case-insensitive; e.g. "_MO MAT JOB BAGS"
+
+
+def _folder_parent_name(folder_id: str) -> str | None:
+    """Return the immediate parent folder's name, or None if not found."""
+    svc = get_drive_service()
+    try:
+        meta = svc.files().get(
+            fileId=folder_id, fields="parents", supportsAllDrives=True,
+        ).execute()
+    except HttpError:
+        return None
+    parents = meta.get("parents") or []
+    if not parents:
+        return None
+    try:
+        parent_meta = svc.files().get(
+            fileId=parents[0], fields="name", supportsAllDrives=True,
+        ).execute()
+    except HttpError:
+        return None
+    return parent_meta.get("name")
+
+
 def find_root_folders(brand_filter: str | None = None) -> list[tuple[str, str]]:
     """Return [(folder_id, title), ...] for every watched print root present in Drive.
+
+    Drive often has multiple folders matching the same Print title (e.g. several
+    "2DD Print" or "EMA Print" folders, only one of which is the doormat
+    print folder — the others are unrelated product lines). The DOORMAT print
+    folder always lives inside a parent folder whose name contains "Job Bag"
+    (e.g. "_MO MAT JOB BAGS", "_EMA ALL WEATHER MAT JOB BAGS"). We filter on
+    that to ignore the non-doormat Print folders.
 
     brand_filter: if provided, only roots containing this substring (case-insensitive)
     are returned. e.g. brand_filter="YCR" → ["YCR Print", "YCR AW Print"].
     """
     svc = get_drive_service()
     roots: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
     for title in ALL_PRINT_ROOTS:
         if brand_filter and brand_filter.lower() not in title.lower():
             continue
@@ -97,7 +129,18 @@ def find_root_folders(brand_filter: str | None = None) -> list[tuple[str, str]]:
             supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives",
         ).execute()
         for f in resp.get("files", []):
-            roots.append((f["id"], f["name"]))
+            parent_name = _folder_parent_name(f["id"]) or ""
+            if REQUIRED_PARENT_FRAGMENT.lower() in parent_name.lower():
+                roots.append((f["id"], f["name"]))
+            else:
+                skipped.append((f["name"], parent_name or "<no parent>"))
+
+    if skipped:
+        print(f"[orphans] ignored {len(skipped)} non-doormat Print folder(s) "
+              f"(parent does not contain '{REQUIRED_PARENT_FRAGMENT}'):")
+        for name, parent in skipped:
+            print(f"           - {name}  (parent: {parent})")
+
     return roots
 
 
