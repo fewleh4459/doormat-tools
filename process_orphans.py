@@ -75,7 +75,17 @@ def is_statics_folder(name: str) -> bool:
     return "static" in normalise(name)
 
 
-REQUIRED_PARENT_FRAGMENT = "job bag"  # case-insensitive; e.g. "_MO MAT JOB BAGS"
+# Parent-folder name patterns that disambiguate the doormat Print folder
+# from non-doormat siblings (apparel, stationery, etc. — which also have
+# their own "X Print" folders inside the same brand workspace).
+#
+# Coir doormat Print folders live inside "X MAT JOB BAGS" / "X Mat Job Bag" /
+# "X Coir Mat Job Bag" → all contain "mat job bag".
+#
+# AW (all-weather) Print folders live inside "X ALL WEATHER MAT JOB BAGS" or
+# "X Weatherproof Mat Job Bag" → all contain "weather".
+COIR_REQUIRED_PARENT_FRAGMENT = "mat job bag"
+AW_REQUIRED_PARENT_FRAGMENT = "weather"
 
 
 def _folder_parent_name(folder_id: str) -> str | None:
@@ -114,10 +124,16 @@ def find_root_folders(brand_filter: str | None = None) -> list[tuple[str, str]]:
     """
     svc = get_drive_service()
     roots: list[tuple[str, str]] = []
-    skipped: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str, str]] = []
     for title in ALL_PRINT_ROOTS:
         if brand_filter and brand_filter.lower() not in title.lower():
             continue
+
+        required = (
+            AW_REQUIRED_PARENT_FRAGMENT if title in AW_PRINT_ROOTS
+            else COIR_REQUIRED_PARENT_FRAGMENT
+        )
+
         safe = title.replace("'", "\\'")
         q = (
             f"name = '{safe}'"
@@ -130,16 +146,15 @@ def find_root_folders(brand_filter: str | None = None) -> list[tuple[str, str]]:
         ).execute()
         for f in resp.get("files", []):
             parent_name = _folder_parent_name(f["id"]) or ""
-            if REQUIRED_PARENT_FRAGMENT.lower() in parent_name.lower():
+            if required.lower() in parent_name.lower():
                 roots.append((f["id"], f["name"]))
             else:
-                skipped.append((f["name"], parent_name or "<no parent>"))
+                skipped.append((f["name"], parent_name or "<no parent>", required))
 
     if skipped:
-        print(f"[orphans] ignored {len(skipped)} non-doormat Print folder(s) "
-              f"(parent does not contain '{REQUIRED_PARENT_FRAGMENT}'):")
-        for name, parent in skipped:
-            print(f"           - {name}  (parent: {parent})")
+        print(f"[orphans] ignored {len(skipped)} non-doormat Print folder(s):")
+        for name, parent, required in skipped:
+            print(f"           - {name}  (parent: {parent}; needed '{required}')")
 
     return roots
 
