@@ -281,23 +281,29 @@ def walk_statics(
 
 # ── Processing ───────────────────────────────────────────────────────────────
 
-def process_orphan(item: dict, dry_run: bool) -> tuple[str, str]:
-    """Returns (outcome, detail). outcome: 'processed', 'skipped', 'error'."""
+def process_orphan(item: dict, dry_run: bool, ignore_richblack: bool = False) -> tuple[str, str]:
+    """Returns (outcome, detail). outcome: 'processed', 'skipped', 'error'.
+
+    ignore_richblack: if True, files that exist in the sibling _RichBlack/
+    subfolder are NOT treated as already-processed. Used when the user
+    wants to regenerate the legacy _RichBlack outputs with the latest
+    code. Files with a top-level <stem>_p.pdf companion are still skipped
+    (those are from the current convention, on the latest code).
+    """
     name = item["name"]
     stem = os.path.splitext(name)[0]
     parent_id = item["parent_id"]
     file_id = item["id"]
     force_size = item["force_size"]
 
-    # Three in-memory checks (all built during walk_statics, no API calls):
-    #   1. Did historical batch processing already write this file into the
-    #      sibling _RichBlack/ subfolder? (true for the bulk of statics)
-    #   2. Does a "<stem>_p.pdf" sibling exist at top level? (watcher convention)
-    #   3. Fallback: API call if no sets were supplied (defensive)
-    historical = item.get("_historical_processed_in_folder", set())
-    if name in historical:
-        return "skipped", f"{name}: already in _RichBlack/"
+    # In-memory skip checks (all built during walk_statics, no API calls).
+    if not ignore_richblack:
+        historical = item.get("_historical_processed_in_folder", set())
+        if name in historical:
+            return "skipped", f"{name}: already in _RichBlack/"
 
+    # Top-level <stem>_p.pdf check always applies — those are on current code,
+    # no reason to reprocess them.
     p_stems = item.get("_p_stems_in_folder")
     if p_stems is not None:
         if stem in p_stems:
@@ -458,9 +464,15 @@ def main():
                     help="Limit to roots whose name contains this string (e.g. YCR)")
     ap.add_argument("--skip-lrg-gen", action="store_true",
                     help="Skip LRG-from-REG generation pass")
+    ap.add_argument("--ignore-richblack", action="store_true",
+                    help="Reprocess files that have a sibling _RichBlack/<name>.pdf "
+                         "(those were produced by the legacy batch code with the "
+                         "brown-icon CMYK bug). Files with a top-level <stem>_p.pdf "
+                         "companion are still skipped — those are on current code.")
     args = ap.parse_args()
 
-    print(f"[orphans] starting (dry_run={args.dry_run}, brand={args.brand or 'all'})")
+    print(f"[orphans] starting (dry_run={args.dry_run}, brand={args.brand or 'all'}, "
+          f"ignore_richblack={args.ignore_richblack})")
 
     roots = find_root_folders(brand_filter=args.brand)
     if not roots:
@@ -486,7 +498,9 @@ def main():
     print(f"\n[orphans] Pass 1 — processing {len(all_items)} orphan candidate(s)")
     counts = defaultdict(int)
     for i, item in enumerate(all_items, 1):
-        outcome, detail = process_orphan(item, dry_run=args.dry_run)
+        outcome, detail = process_orphan(
+            item, dry_run=args.dry_run, ignore_richblack=args.ignore_richblack
+        )
         counts[outcome] += 1
         print(f"  [{i}/{len(all_items)}] {outcome}: {detail}")
 
