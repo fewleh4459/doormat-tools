@@ -251,10 +251,15 @@ def walk_statics(
                 continue
 
             if not now_inside:
-                continue  # only collect PDFs inside a statics subtree
-            if not name.lower().endswith(".pdf"):
+                continue  # only collect design files inside a statics subtree
+            # Accept PDF originals AND raster originals (JPG/JPEG/PNG). fitz
+            # opens raster formats natively, so vectorize_v2.process_pdf works
+            # without modification — output is always <stem>_p.pdf regardless
+            # of input extension.
+            lower = name.lower()
+            if not any(lower.endswith(ext) for ext in (".pdf", ".jpg", ".jpeg", ".png")):
                 continue
-            if name.lower().endswith("_p.pdf"):
+            if lower.endswith("_p.pdf"):
                 continue
 
             # AW vs non-AW: if root is in AW_PRINT_ROOTS and no folder-level size was
